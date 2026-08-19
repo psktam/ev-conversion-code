@@ -6,6 +6,22 @@
 
 const int INT_EV = 6;
 const int SPI_CS_EV = 8;
+// pullups
+const int DI_BRAKE_WARNING = 1;
+const int DI_12V_BATT_WARNING = 2;
+const int DI_ABS_WARNING = 3;
+const int DI_SEAT_BELTS = 4;
+// pulldowns
+const int DI_HI_BEAM = 5;
+const int DI_LEFT_TURN = 6;
+const int DI_RIGHT_TURN = 7;
+// Pullups
+const int DI_FL_DOOR_WARNING = 8; 
+const int DI_FR_DOOR_WARNING = 9;
+const int DI_RL_DOOR_WARNING = 10;
+const int DI_RR_DOOR_WARNING = 11;
+const int DI_TAILGATE_WARNING = 12;
+
 unsigned long last_dispatch_time = 0;
 
 MCP_CAN ev_can(SPI_CS_EV);
@@ -14,7 +30,19 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Initialized");
   pinMode(INT_EV, INPUT);
-  pinMode(13, OUTPUT);
+
+  pinMode(DI_BRAKE_WARNING, INPUT);
+  pinMode(DI_12V_BATT_WARNING, INPUT);
+  pinMode(DI_ABS_WARNING, INPUT);
+  pinMode(DI_SEAT_BELTS, INPUT);
+  pinMode(DI_HI_BEAM, INPUT);
+  pinMode(DI_LEFT_TURN, INPUT);
+  pinMode(DI_RIGHT_TURN, INPUT);
+  pinMode(DI_FL_DOOR_WARNING, INPUT);
+  pinMode(DI_FR_DOOR_WARNING, INPUT);
+  pinMode(DI_RL_DOOR_WARNING, INPUT);
+  pinMode(DI_RR_DOOR_WARNING, INPUT);
+  pinMode(DI_TAILGATE_WARNING, INPUT);
 
   uint8_t ret = ev_can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ);
   if (ret == CAN_OK) {
@@ -45,8 +73,8 @@ void convert_513_values(
   //   B5-6: vehicle speed
   //   B7: accelerator pedal position
   //   B8: some accelerometer value
-  buf[0] = engine_speed / 256;
-  buf[1] = engine_speed % 256;
+  buf[0] = (engine_speed * 4) >> 8;
+  buf[1] = (engine_speed * 4) & 0x00ff;
   buf[4] = vehicle_speed / 256;
   buf[5] = vehicle_speed % 256;
 }
@@ -176,6 +204,7 @@ void loop() {
   uint8_t ret;
   uint8_t buf[24];
 
+  // process all inputs
   if (!digitalRead(INT_EV)) {
     ret = ev_can.readMsgBuf(&id, &len, buf);
     if (ret != CAN_OK) {
@@ -184,7 +213,7 @@ void loop() {
     }
 
     handle_bms_message(id, len, buf);
-    handle_power_steering_pump_message(id, len, buf);
+    // handle_power_steering_pump_message(id, len, buf);
 
     if (id == 0x18ff50e5) {  // charger message
       Serial.print(millis() / 1000);
@@ -202,9 +231,12 @@ void loop() {
     }
   }
 
+
+
   // Send info to CAN pump every 10ms or so
   if (millis() - last_dispatch_time > 10) {
-    convert_513_values(1000, 50, buf);
+    Serial.println("dispatched message to PS Pump");
+    convert_513_values(500, 0, buf);
     ev_can.sendMsgBuf(513, 0, 8, buf);
     last_dispatch_time = millis();
   }
