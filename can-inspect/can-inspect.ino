@@ -1,8 +1,11 @@
 #include <mcp_can_dfs.h>
 #include <mcp_can.h>
 
+#include <Adafruit_LEDBackpack.h>
 #include <SPI.h>
 #include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>
 
 const int INT_EV = 6;
 const int SPI_CS_EV = 8;
@@ -22,9 +25,91 @@ const int DI_RL_DOOR_WARNING = 10;
 const int DI_RR_DOOR_WARNING = 11;
 const int DI_TAILGATE_WARNING = 12;
 
+// some SPI configuration
+const int DO_LEFT_LCD_CS = 13;
+const int DO_RIGHT_LCD_CS = 14;
+
+// some I2C configuration
+const int I2C_ADDR_SPEED_DISPLAY = 0x23;
+const int I2C_ADDR_TACH_DISPLAY = 0x24;
+
+// LCD pins
+const int PWM_LCD_R = 15;
+const int PWM_LCD_G = 16;
+const int PWM_LCD_B = 17;
+const int DO_LCD_RS = 18;
+const int DO_LCD_EN = 19;
+const int DO_LCD_DB4 = 20;
+const int DO_LCD_DB5 = 21;
+const int DO_LCD_DB6 = 22;
+const int DO_LCD_DB7 = 23;
+
+const int AI_VSS = 13;
+
 unsigned long last_dispatch_time = 0;
 
 MCP_CAN ev_can(SPI_CS_EV);
+
+LiquidCrystal lcd(DO_LCD_RS, DO_LCD_EN, DO_LCD_DB4, DO_LCD_DB5, DO_LCD_DB6, DO_LCD_DB7);
+byte CHAR_FULL_BAR = 0;
+byte full_bar[8] = {
+  0xff,
+  0xff,
+  0xff,
+  0xff,
+  0xff,
+  0xff,
+  0xff,
+  0xff
+};
+byte CHAR_EMPTY_BAR = 1;
+byte empty_bar[8] = {
+ 0b11111,
+ 0b10001,
+ 0b10001,
+ 0b10001,
+ 0b10001,
+ 0b10001,
+ 0b10001,
+ 0b11111
+};
+
+// meh, I don't like these Adafruit libraries, but that's because 
+// I'm a crank
+Adafruit_7segment speedometer_display_7seg = Adafruit_7segment();
+Adafruit_7segment tachometer_display_7seg = Adafruit_7segment();
+
+// we transfer in mode 0, with COPA 0 and CPHA 0
+// this is a hand-rolled SPI function meant to get 
+// around the fact that my wires are absolute garbage.
+// Need to waaay slow down SPI transactions with the ESP32s.
+uint8_t SPITransfer(uint8_t data, uint8_t cyc_ms) {
+  uint16_t delayus = cyc_ms * 1000;
+  uint8_t mask = 0b10000000;
+  uint8_t returnValue = 0;
+
+  delayMicroseconds(delayus / 4);
+  for (int i = 0; i < 8; i ++) {
+    // set MOSI pin first
+    if ((mask & data) > 0) {
+      digitalWrite(MOSI, HIGH);
+    } else {
+      digitalWrite(MOSI, LOW);
+    }
+    delayMicroseconds(delayus / 4);
+
+    // then cycle SCK
+    digitalWrite(SCK, HIGH);
+    delayMicroseconds(delayus / 4);
+    returnValue |= (digitalRead(MISO) << i);
+    mask = mask >> 1;
+    digitalWrite(SCK, LOW);
+    delayMicroseconds(delayus / 4);
+  }
+  digitalWrite(MOSI, LOW);
+
+  return returnValue;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -43,6 +128,16 @@ void setup() {
   pinMode(DI_RL_DOOR_WARNING, INPUT);
   pinMode(DI_RR_DOOR_WARNING, INPUT);
   pinMode(DI_TAILGATE_WARNING, INPUT);
+  pinMode(AI_VSS, INPUT);
+
+  Wire.begin();
+
+  lcd.createChar(CHAR_FULL_BAR, full_bar);
+  lcd.createChar(CHAR_EMPTY_BAR, empty_bar);
+  lcd.begin(20, 4, LCD_5x8DOTS);
+
+  speedometer_display_7seg.begin(I2C_ADDR_SPEED_DISPLAY);
+  tachometer_display_7seg.begin(I2C_ADDR_TACH_DISPLAY);
 
   uint8_t ret = ev_can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ);
   if (ret == CAN_OK) {
@@ -89,17 +184,8 @@ void handle_bms_message(uint32_t message_id, uint8_t len, uint8_t buf[]) {
   }
 }
 
-void handle_power_steering_pump_message(uint32_t message_id, uint8_t len, uint8_t buf[]) {
-  if (message_id == 576) {
-    Serial.println("Power steering torque_related");
-    uint8_t first_byte = (buf[0] << 7) | (buf[1] >> 1);
-    uint8_t second_byte = (buf[1] << 7) | (buf[2] >> 1);
-    uint16_t torque = (first_byte << 8) | second_byte;
+void handle_x1_CAN_message(uint32_t message_id, uint8_t len, uint8_t buf[]) {
 
-    Serial.print("    Torque: ");
-    Serial.print(torque);
-    Serial.println("");
-  }
 }
 
 void print_charger_message(uint8_t len, uint8_t buf[]) {
@@ -198,6 +284,70 @@ void print_bms_status(uint8_t buf[]) {
   Serial.print("    Temperature: "); Serial.print(temp, 1); Serial.println(" C");
 }
 
+// vehicle properties to track from loop to loop
+// these are mostly going to be from CAN
+uint8_t max_pack_voltage = 0;
+uint8_t min_pack_voltage = 0;
+uint8_t max_pack_temperature = 0;
+uint8_t min_pack_temperature = 0;
+uint16_t pack_charge_level = 0;
+
+uint16_t motor_tach_raw = 0;
+
+void writeLCD() {
+  lcd.clear();
+  
+  // display tach values
+  float max_tach = 1024.0;
+  float tach_ratio_f = (float)motor_tach_raw / max_tach * 15;
+  int tach_ratio_i = roundf(tach_ratio_f);
+
+  lcd.print("Tach:");
+  for (int i=0; i < tach_ratio_i; i++) {
+    if (i < 10) {
+      lcd.write(CHAR_EMPTY_BAR);
+    } else {
+      lcd.write(CHAR_FULL_BAR);
+    }
+  }
+
+  // display charge values
+  float max_charge = 1024.0;
+  float charge_ratio_f = (float)pack_charge_level / max_charge * 13;
+  int charge_ratio_i = roundf(charge_ratio_f);
+  lcd.setCursor(0, 1);
+  lcd.print("Charge:");
+
+  for (int i=0; i < charge_ratio_i; i++){
+    if (i > 0) {
+      lcd.write(CHAR_FULL_BAR);
+    } else {
+      lcd.write(CHAR_EMPTY_BAR);
+    }
+  }
+
+}
+
+void writeBatteryTFT() {
+  digitalWrite(DO_LEFT_LCD_CS, HIGH);
+  delay(1);
+  SPITransfer(max_pack_voltage, 5);
+  SPITransfer(min_pack_voltage, 5);
+  SPITransfer(max_pack_temperature, 5);
+  SPITransfer(min_pack_temperature, 5);
+  delay(1);
+  digitalWrite(DO_LEFT_LCD_CS, LOW);
+}
+
+void writeVehicleStatusTFT(bool fl_door, bool fr_door, bool rl_door, bool rr_door, bool tailgate) {
+  byte status = tailgate + 2 * rr_door + 4 * rl_door + 8 * fr_door + 16 * fl_door;
+  digitalWrite(DO_RIGHT_LCD_CS, HIGH);
+  delay(1);
+  SPITransfer(status, 5);
+  delay(1);
+  digitalWrite(DO_RIGHT_LCD_CS, LOW);
+}
+
 void loop() {
   uint32_t id; 
   uint8_t len; 
@@ -205,6 +355,7 @@ void loop() {
   uint8_t buf[24];
 
   // process all inputs
+  // first, process whatever might have come over from the CAN bus.
   if (!digitalRead(INT_EV)) {
     ret = ev_can.readMsgBuf(&id, &len, buf);
     if (ret != CAN_OK) {
@@ -213,25 +364,41 @@ void loop() {
     }
 
     handle_bms_message(id, len, buf);
-    // handle_power_steering_pump_message(id, len, buf);
+    handle_x1_CAN_message(id, len, buf);
 
-    if (id == 0x18ff50e5) {  // charger message
-      Serial.print(millis() / 1000);
-      Serial.println(": Got a message from the charger:");
-      print_charger_message(len, buf);
-    } else {
-      char buffer[10];
-      sprintf(buffer, "%X", id);
-      Serial.print(millis() / 1000);
-      Serial.print(": Got unrecognized CAN message with ID: ");
-      Serial.print(buffer);
-      Serial.print(" and length ");
-      Serial.print(len);
-      Serial.println("");
-    }
   }
 
+  // vehicle speed
+  int vehicle_speed_raw = analogRead(AI_VSS);
+  // a bunch of discrete inputs (wonder if these could be 
+  // replaced with actual hardware and some bulbs)
+  bool status_brake_warning = digitalRead(DI_BRAKE_WARNING);
+  bool status_12v_batt_warning = digitalRead(DI_12V_BATT_WARNING);
+  bool status_abs_warning = digitalRead(DI_ABS_WARNING);
+  bool status_seat_belts = digitalRead(DI_SEAT_BELTS);
+  bool status_hi_beam = digitalRead(DI_HI_BEAM);
+  bool status_left_turn = digitalRead(DI_LEFT_TURN);
+  bool status_right_turn = digitalRead(DI_RIGHT_TURN);
+  bool status_fl_door_warning = digitalRead(DI_FL_DOOR_WARNING);
+  bool status_fr_door_warning = digitalRead(DI_FR_DOOR_WARNING);
+  bool status_rl_door_warning = digitalRead(DI_RL_DOOR_WARNING);
+  bool status_rr_door_warning = digitalRead(DI_RR_DOOR_WARNING);
+  bool status_tailgate_warning = digitalRead(DI_TAILGATE_WARNING);
 
+  // Now we send outputs
+  writeLCD();
+  writeBatteryTFT();
+  writeVehicleStatusTFT(
+      status_fl_door_warning, 
+      status_fr_door_warning,
+      status_rl_door_warning,
+      status_rr_door_warning,
+      status_tailgate_warning
+  );
+  speedometer_display_7seg.print(vehicle_speed_raw, DEC);
+  speedometer_display_7seg.writeDisplay();
+  tachometer_display_7seg.print(motor_tach_raw, DEC);
+  tachometer_display_7seg.writeDisplay();
 
   // Send info to CAN pump every 10ms or so
   if (millis() - last_dispatch_time > 10) {
