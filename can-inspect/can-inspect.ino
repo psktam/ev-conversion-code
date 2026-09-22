@@ -7,8 +7,16 @@
 #include <Wire.h>
 #include <LiquidCrystal.h>
 
-const int INT_EV = 6;
-const int SPI_CS_EV = 8;
+#define CAN_ID_BATT_SOC 853
+#define CAN_ID_BATT_LOWS_AND_HIS 883
+#define CAN_ID_BATT_STATUS 854
+#define CAN_ID_INVERTER_DATA 856
+#define CAN_ID_INVERTER_DIAG 857
+
+const int INT_EV = 49;
+const int SPI_CS_EV = 53;
+const int TFT_SCK = 24;
+const int TFT_MOSI = 25;
 // pullups
 const int DI_BRAKE_WARNING = 1;
 const int DI_12V_BATT_WARNING = 2;
@@ -16,8 +24,6 @@ const int DI_ABS_WARNING = 3;
 const int DI_SEAT_BELTS = 4;
 // pulldowns
 const int DI_HI_BEAM = 5;
-const int DI_LEFT_TURN = 6;
-const int DI_RIGHT_TURN = 7;
 // Pullups
 const int DI_FL_DOOR_WARNING = 8; 
 const int DI_FR_DOOR_WARNING = 9;
@@ -26,25 +32,25 @@ const int DI_RR_DOOR_WARNING = 11;
 const int DI_TAILGATE_WARNING = 12;
 
 // some SPI configuration
-const int DO_LEFT_LCD_CS = 13;
-const int DO_RIGHT_LCD_CS = 14;
+const int DO_LEFT_LCD_CS = 27;
+const int DO_RIGHT_LCD_CS = 26;
 
 // some I2C configuration
-const int I2C_ADDR_SPEED_DISPLAY = 0x23;
-const int I2C_ADDR_TACH_DISPLAY = 0x24;
+const int I2C_ADDR_SPEED_DISPLAY = 0x70;
+const int I2C_ADDR_TACH_DISPLAY = 0x71;
 
 // LCD pins
 const int PWM_LCD_R = 15;
 const int PWM_LCD_G = 16;
 const int PWM_LCD_B = 17;
-const int DO_LCD_RS = 18;
-const int DO_LCD_EN = 19;
-const int DO_LCD_DB4 = 20;
-const int DO_LCD_DB5 = 21;
-const int DO_LCD_DB6 = 22;
-const int DO_LCD_DB7 = 23;
+const int DO_LCD_RS = 39;
+const int DO_LCD_EN = 37;
+const int DO_LCD_DB4 = 43;
+const int DO_LCD_DB5 = 41;
+const int DO_LCD_DB6 = 35;
+const int DO_LCD_DB7 = 33;
 
-const int AI_VSS = 13;
+const int AI_VSS = A0;
 
 unsigned long last_dispatch_time = 0;
 
@@ -92,23 +98,27 @@ uint8_t SPITransfer(uint8_t data, uint8_t cyc_ms) {
   for (int i = 0; i < 8; i ++) {
     // set MOSI pin first
     if ((mask & data) > 0) {
-      digitalWrite(MOSI, HIGH);
+      digitalWrite(TFT_MOSI, HIGH);
     } else {
-      digitalWrite(MOSI, LOW);
+      digitalWrite(TFT_MOSI, LOW);
     }
     delayMicroseconds(delayus / 4);
 
     // then cycle SCK
-    digitalWrite(SCK, HIGH);
+    digitalWrite(TFT_SCK, HIGH);
     delayMicroseconds(delayus / 4);
-    returnValue |= (digitalRead(MISO) << i);
+    returnValue |= (digitalRead(TFT_MOSI) << i);
     mask = mask >> 1;
-    digitalWrite(SCK, LOW);
+    digitalWrite(TFT_SCK, LOW);
     delayMicroseconds(delayus / 4);
   }
-  digitalWrite(MOSI, LOW);
+  digitalWrite(TFT_MOSI, LOW);
 
   return returnValue;
+}
+
+uint16_t SPITransfer16(uint16_t data, uint8_t cyc_ms) {
+  return (SPITransfer(data >> 8, cyc_ms) << 8) | SPITransfer(data & 0xff, cyc_ms);
 }
 
 void setup() {
@@ -121,8 +131,6 @@ void setup() {
   pinMode(DI_ABS_WARNING, INPUT);
   pinMode(DI_SEAT_BELTS, INPUT);
   pinMode(DI_HI_BEAM, INPUT);
-  pinMode(DI_LEFT_TURN, INPUT);
-  pinMode(DI_RIGHT_TURN, INPUT);
   pinMode(DI_FL_DOOR_WARNING, INPUT);
   pinMode(DI_FR_DOOR_WARNING, INPUT);
   pinMode(DI_RL_DOOR_WARNING, INPUT);
@@ -130,22 +138,25 @@ void setup() {
   pinMode(DI_TAILGATE_WARNING, INPUT);
   pinMode(AI_VSS, INPUT);
 
+  pinMode(DO_LCD_RS, OUTPUT);
+  pinMode(DO_LCD_EN, OUTPUT);
+  pinMode(DO_LCD_DB4, OUTPUT);
+  pinMode(DO_LCD_DB5, OUTPUT);
+  pinMode(DO_LCD_DB6, OUTPUT);
+  pinMode(DO_LCD_DB7, OUTPUT);
+
   Wire.begin();
 
   lcd.createChar(CHAR_FULL_BAR, full_bar);
   lcd.createChar(CHAR_EMPTY_BAR, empty_bar);
   lcd.begin(20, 4, LCD_5x8DOTS);
+  lcd.print("initializing...");
 
   speedometer_display_7seg.begin(I2C_ADDR_SPEED_DISPLAY);
+  Serial.println("initialized speedometer 7seg");
   tachometer_display_7seg.begin(I2C_ADDR_TACH_DISPLAY);
+  Serial.println("initialized tachometer 7seg");
 
-  uint8_t ret = ev_can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ);
-  if (ret == CAN_OK) {
-    ev_can.setMode(MCP_NORMAL);
-    Serial.println("EV CAN initialization successful");
-  } else {
-    Serial.println("Error initializing EV CAN");
-  }
   last_dispatch_time = millis();
 }
 
@@ -174,137 +185,83 @@ void convert_513_values(
   buf[5] = vehicle_speed % 256;
 }
 
-void handle_bms_message(uint32_t message_id, uint8_t len, uint8_t buf[]) {
-  if (message_id == 849) {
-    print_bms_setpoints(buf);
-  } else if (message_id == 853) {
-    print_bms_soc(buf);
-  } else if (message_id == 854) {
-    print_bms_status(buf);
+// battery pack singleton data
+uint16_t battery_state_of_charge_decipct = 1000;  // "decipercent"
+uint16_t battery_summary_voltage_v;
+uint16_t battery_summary_current_a;
+uint16_t battery_summary_temperature_c;
+uint16_t battery_max_pack_voltage_v;
+uint16_t battery_min_pack_voltage_v;
+uint16_t battery_max_pack_temp_c;
+uint16_t battery_min_pack_temp_c;
+
+
+bool unpackBMSCAN(uint32_t message_id, uint8_t len, uint8_t buf[]) {
+  if (message_id == CAN_ID_BATT_SOC) { 
+    battery_state_of_charge_decipct = buf[4] | (buf[5] << 8);
+    return true;
+
+  } else if (message_id == CAN_ID_BATT_LOWS_AND_HIS) { 
+    battery_min_pack_voltage_v = buf[0] | (buf[1] << 8);
+    battery_max_pack_voltage_v = buf[2] | (buf[3] << 8);
+    battery_min_pack_temp_c = buf[4] | (buf[5] << 8);
+    battery_max_pack_temp_c = buf[6] | (buf[7] << 8);
+    return true;
+
+  } else if (message_id == CAN_ID_BATT_STATUS) {
+    battery_summary_voltage_v = buf[0] | (buf[1] << 8);
+    battery_summary_current_a = buf[2] | (buf[3] << 8);
+    battery_summary_temperature_c = buf[4] | (buf[5] << 8);
+    return true;
   }
+  return false;
 }
 
-void handle_x1_CAN_message(uint32_t message_id, uint8_t len, uint8_t buf[]) {
+int16_t inverter_motor_speed_rpm = 5000; // [-32768, 32767] <-> [-32768, 32767]
+uint8_t inverter_motor_temp_c; // [0, 255] <-> [-40, 215]
+uint8_t inverter_temp_1_c; // [0, 255] <-> [-40, 215]
+int16_t inverter_motor_current_arms; // [-32768, 32767] <-> [-3276.8, 3276.7]
+int16_t inverter_motor_torque_pct; // [-32768, 32767] <-> [-100, 100]
+uint16_t inverter_sys_flags = 0;
+uint8_t inverter_worst_fault_code = 0;
+uint8_t inverter_worst_fault_level = 0;
+uint32_t inverter_odometer = 0;
 
+
+bool unpackInverterCAN(uint32_t message_id, uint8_t len, uint8_t buf[]) {
+  if (message_id == CAN_ID_INVERTER_DATA) {
+    inverter_motor_speed_rpm = buf[0] | (buf[1] << 8);
+    inverter_motor_temp_c = buf[2];
+    inverter_temp_1_c = buf[3];
+    inverter_motor_current_arms = buf[4] | (buf[5] << 8);
+    inverter_motor_torque_pct = buf[6] | (buf[7] << 8);
+    return true;
+
+  } else if (message_id == CAN_ID_INVERTER_DIAG) {
+    inverter_sys_flags = buf[0] | (buf[1] << 8);
+    inverter_worst_fault_code = buf[2];
+    inverter_worst_fault_level = buf[3];
+    inverter_odometer = buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24);
+
+    return true;
+  }
+  return false;
 }
 
-void print_charger_message(uint8_t len, uint8_t buf[]) {
-  uint16_t voltage = (buf[0] << 8) | buf[1];
-  uint16_t current = (buf[2] << 8) | buf[3];
-  uint8_t status = buf[4];
-
-  bool hardware_failure = (status & 1) == 1;
-  bool overtemp_protection_active = (status & 2) == 1;
-  bool input_voltage_invalid = (status & 4) == 1;
-  bool reverse_polarity_protection_active = (status & 8) == 1;
-  bool comm_timeout = (status & 16) == 1;
-
-
-  Serial.println("Charger sent a message indicating:");
-  Serial.print("    Output voltage: ");
-  Serial.print(voltage);
-  Serial.println("");
-
-  Serial.print("    Output current: ");
-  Serial.print(current);
-  Serial.println("");
-
-  if (status > 0) {
-    Serial.println("    Diagnostic status detected");
-  }
-  if (hardware_failure) {
-    Serial.println("        Hardware failure detected");
-  }
-  if (overtemp_protection_active) {
-    Serial.println("        Overtemp protection active");
-  }
-  if (input_voltage_invalid) {
-    Serial.println("        Invalid input voltage");
-  }
-  if (reverse_polarity_protection_active) {
-    Serial.println("        Reverse polarity protection activated");
-  }
-  if (comm_timeout) {
-    Serial.println("        Comms timeout");
-  }
-
-}
-
-// message ID 849
-void print_bms_setpoints(uint8_t buf[]) {
-  uint16_t charge_voltage_u16 = buf[0] | (buf[1] << 8);
-  float charge_voltage = charge_voltage_u16 * 0.1;
-
-  uint16_t charge_current_u16 = buf[2] | (buf[3] << 8);
-  float charge_current = charge_current_u16 * 0.1;
-
-  uint16_t discharge_current_u16 = buf[4] | (buf[5] << 8);
-  float discharge_current = discharge_current_u16 * 0.1;
-
-  uint16_t discharge_voltage_u16 = buf[6] | (buf[7] << 8);
-  float discharge_voltage = discharge_voltage_u16 * 0.1;
-
-  // arduino's implementation of sprintf can't handle floating points 
-  // natively.
-  Serial.println("Vero BMS setpoints");
-  Serial.print("    Charge voltage: "); Serial.print(charge_voltage, 1); Serial.println(" V");
-  Serial.print("    Charge current: "); Serial.print(charge_current, 1); Serial.println(" A");
-  Serial.print("    Discharge voltage: "); Serial.print(discharge_voltage, 1); Serial.println(" V");
-  Serial.print("    Discharge current: "); Serial.print(discharge_current, 1); Serial.println(" A");
-}
-
-void print_bms_soc(uint8_t buf[]) {
-  uint16_t soc = buf[0] | (buf[1] << 8);
-  uint16_t soh = buf[2] | (buf[3] << 8);
-  uint16_t soc_dec_u16 = buf[4] | (buf[5] << 8);
-  float soc_dec = soc_dec_u16 * 0.1;
-
-  Serial.println("Vero BMS charge/health readings");
-  char printbuf[40];
-  sprintf(printbuf, "    State of charge: %u %%", soc);
-  Serial.println(printbuf);
-  sprintf(printbuf, "    State of health: %u %%", soh);
-  Serial.println(printbuf);
-  Serial.print("    State of charge (decimal): "); Serial.print(soc_dec, 1); Serial.println(" %");
-}
-
-void print_bms_status(uint8_t buf[]) {
-  uint16_t voltage_u16 = buf[0] | (buf[1] << 8);
-  float voltage = voltage_u16 * 0.01;
-
-  int16_t current_i16 = buf[2] | (buf[3] << 8);
-  float current = current_i16 * 0.1;
-
-  int16_t temperature_i16 = buf[4] | (buf[5] << 8);
-  float temp = temperature_i16 * 0.1;
-
-  Serial.println("Vero BMS status");
-  Serial.print("    Voltage: "); Serial.print(voltage, 2); Serial.println(" V");
-  Serial.print("    Current: "); Serial.print(current, 1); Serial.println(" A");
-  Serial.print("    Temperature: "); Serial.print(temp, 1); Serial.println(" C");
-}
-
-// vehicle properties to track from loop to loop
-// these are mostly going to be from CAN
-uint8_t max_pack_voltage = 0;
-uint8_t min_pack_voltage = 0;
-uint8_t max_pack_temperature = 0;
-uint8_t min_pack_temperature = 0;
-uint16_t pack_charge_level = 0;
-
-uint16_t motor_tach_raw = 0;
 
 void writeLCD() {
   lcd.clear();
-  
-  // display tach values
-  float max_tach = 1024.0;
-  float tach_ratio_f = (float)motor_tach_raw / max_tach * 15;
-  int tach_ratio_i = roundf(tach_ratio_f);
 
+  // display tach values
+  float max_rpm = 7500.0;
+  float redline = 6500.0;
+  float tach_ratio_f = (float)inverter_motor_speed_rpm / max_rpm * 15;
+  int tach_ratio_i = max(roundf(tach_ratio_f), 1);
+
+  lcd.setCursor(0, 0);
   lcd.print("Tach:");
   for (int i=0; i < tach_ratio_i; i++) {
-    if (i < 10) {
+    if (i < 13) {
       lcd.write(CHAR_EMPTY_BAR);
     } else {
       lcd.write(CHAR_FULL_BAR);
@@ -312,11 +269,11 @@ void writeLCD() {
   }
 
   // display charge values
-  float max_charge = 1024.0;
-  float charge_ratio_f = (float)pack_charge_level / max_charge * 13;
-  int charge_ratio_i = roundf(charge_ratio_f);
+  float battery_charge_pct = (float)battery_state_of_charge_decipct * 0.1;
+  float charge_ratio_f = battery_charge_pct / 100.0 * 15;
+  int charge_ratio_i = max(roundf(charge_ratio_f), 1);
   lcd.setCursor(0, 1);
-  lcd.print("Charge:");
+  lcd.print("Batt:");
 
   for (int i=0; i < charge_ratio_i; i++){
     if (i > 0) {
@@ -325,27 +282,36 @@ void writeLCD() {
       lcd.write(CHAR_EMPTY_BAR);
     }
   }
-
 }
 
 void writeBatteryTFT() {
   digitalWrite(DO_LEFT_LCD_CS, HIGH);
   delay(1);
-  SPITransfer(max_pack_voltage, 5);
-  SPITransfer(min_pack_voltage, 5);
-  SPITransfer(max_pack_temperature, 5);
-  SPITransfer(min_pack_temperature, 5);
+  SPITransfer16(battery_max_pack_voltage_v, 5);
+  SPITransfer16(battery_min_pack_voltage_v, 5);
+  SPITransfer16(battery_max_pack_temp_c, 5);
+  SPITransfer16(battery_min_pack_temp_c, 5);
   delay(1);
   digitalWrite(DO_LEFT_LCD_CS, LOW);
 }
 
-void writeVehicleStatusTFT(bool fl_door, bool fr_door, bool rl_door, bool rr_door, bool tailgate) {
-  byte status = tailgate + 2 * rr_door + 4 * rl_door + 8 * fr_door + 16 * fl_door;
-  digitalWrite(DO_RIGHT_LCD_CS, HIGH);
-  delay(1);
-  SPITransfer(status, 5);
-  delay(1);
-  digitalWrite(DO_RIGHT_LCD_CS, LOW);
+void writeVehicleStatusTFT() {
+  // uint16_t status = status_brake_warning | 
+  //   (status_12v_batt_warning << 1) | 
+  //   (status_abs_warning << 2) |
+  //   (status_seat_belts << 3) | 
+  //   (status_hi_beam << 4) |
+  //   (status_fl_door_warning << 5) |
+  //   (status_fr_door_warning << 6) | 
+  //   (status_rl_door_warning << 7) | 
+  //   (status_rr_door_warning << 8) | 
+  //   (status_tailgate_warning << 9);
+  //
+  // digitalWrite(DO_RIGHT_LCD_CS, HIGH);
+  // delay(1);
+  // SPITransfer16(status, 5);
+  // delay(1);
+  // digitalWrite(DO_RIGHT_LCD_CS, LOW);
 }
 
 void loop() {
@@ -360,12 +326,10 @@ void loop() {
     ret = ev_can.readMsgBuf(&id, &len, buf);
     if (ret != CAN_OK) {
       Serial.println("Error decoding CAN message");
-      return;
+    } else {
+      unpackBMSCAN(id, len, buf);
+      unpackInverterCAN(id, len, buf);
     }
-
-    handle_bms_message(id, len, buf);
-    handle_x1_CAN_message(id, len, buf);
-
   }
 
   // vehicle speed
@@ -377,34 +341,29 @@ void loop() {
   bool status_abs_warning = digitalRead(DI_ABS_WARNING);
   bool status_seat_belts = digitalRead(DI_SEAT_BELTS);
   bool status_hi_beam = digitalRead(DI_HI_BEAM);
-  bool status_left_turn = digitalRead(DI_LEFT_TURN);
-  bool status_right_turn = digitalRead(DI_RIGHT_TURN);
   bool status_fl_door_warning = digitalRead(DI_FL_DOOR_WARNING);
   bool status_fr_door_warning = digitalRead(DI_FR_DOOR_WARNING);
   bool status_rl_door_warning = digitalRead(DI_RL_DOOR_WARNING);
   bool status_rr_door_warning = digitalRead(DI_RR_DOOR_WARNING);
   bool status_tailgate_warning = digitalRead(DI_TAILGATE_WARNING);
 
-  // Now we send outputs
+  // Now we send and set the outputs
   writeLCD();
   writeBatteryTFT();
-  writeVehicleStatusTFT(
-      status_fl_door_warning, 
-      status_fr_door_warning,
-      status_rl_door_warning,
-      status_rr_door_warning,
-      status_tailgate_warning
-  );
+  writeVehicleStatusTFT();
+
   speedometer_display_7seg.print(vehicle_speed_raw, DEC);
   speedometer_display_7seg.writeDisplay();
-  tachometer_display_7seg.print(motor_tach_raw, DEC);
+  tachometer_display_7seg.print(inverter_motor_speed_rpm, DEC);
   tachometer_display_7seg.writeDisplay();
 
   // Send info to CAN pump every 10ms or so
-  if (millis() - last_dispatch_time > 10) {
-    Serial.println("dispatched message to PS Pump");
-    convert_513_values(500, 0, buf);
-    ev_can.sendMsgBuf(513, 0, 8, buf);
-    last_dispatch_time = millis();
-  }
+  // if (millis() - last_dispatch_time > 10) {
+  //   Serial.println("dispatched message to PS Pump");
+  //   convert_513_values(500, 0, buf);
+  //   ev_can.sendMsgBuf(513, 0, 8, buf);
+  //   last_dispatch_time = millis();
+  // }
+
+  delay(50);
 }
