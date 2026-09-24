@@ -4,6 +4,7 @@
 #include <Adafruit_LEDBackpack.h>
 #include <SPI.h>
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <Wire.h>
 #include <LiquidCrystal.h>
 
@@ -12,6 +13,9 @@
 #define CAN_ID_BATT_STATUS 854
 #define CAN_ID_INVERTER_DATA 856
 #define CAN_ID_INVERTER_DIAG 857
+
+// converts pulse rate in Hz to mph
+const float SPEED_CONVERSION_FACTOR = 0.6785;
 
 const int INT_EV = 49;
 const int SPI_CS_EV = 53;
@@ -53,6 +57,20 @@ const int DO_LCD_DB7 = 33;
 const int AI_VSS = A0;
 
 unsigned long last_dispatch_time = 0;
+long current_cycle_time;
+long previous_cycle_time;
+
+union M {
+ uint32_t as_int;
+ float as_float;
+};
+
+const int DI_ODOMETER_PIN = 2;
+M mileage;
+long last_eeprom_write_time = 0;
+volatile uint16_t odometer_pulses = 0;
+long last_odometer_read_time_ms;
+
 
 MCP_CAN ev_can(SPI_CS_EV);
 
@@ -118,13 +136,22 @@ uint8_t SPITransfer(uint8_t data, uint8_t cyc_ms) {
 }
 
 uint16_t SPITransfer16(uint16_t data, uint8_t cyc_ms) {
-  return (SPITransfer(data >> 8, cyc_ms) << 8) | SPITransfer(data & 0xff, cyc_ms);
+  return SPITransfer(data & 0xff, cyc_ms) | (SPITransfer(data >> 8, cyc_ms) << 8);
 }
 
 void setup() {
+  current_cycle_time = millis();
+  previous_cycle_time = current_cycle_time;
+
   Serial.begin(115200);
   Serial.println("Initialized");
   pinMode(INT_EV, INPUT);
+  uint8_t ret = ev_can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ);
+  if (ret == CAN_OK) {
+    ev_can.setMode(MCP_NORMAL);
+  } else {
+    Serial.println("error initializing CAN");
+  }
 
   pinMode(DI_BRAKE_WARNING, INPUT);
   pinMode(DI_12V_BATT_WARNING, INPUT);
@@ -145,6 +172,16 @@ void setup() {
   pinMode(DO_LCD_DB6, OUTPUT);
   pinMode(DO_LCD_DB7, OUTPUT);
 
+  pinMode(DO_LEFT_LCD_CS, OUTPUT);
+  pinMode(DO_RIGHT_LCD_CS, OUTPUT);
+  pinMode(SPI_CS_EV, OUTPUT);
+  pinMode(TFT_SCK, OUTPUT);
+  pinMode(TFT_MOSI, OUTPUT);
+  pinMode(DI_ODOMETER_PIN, INPUT_PULLUP);
+
+  digitalWrite(DO_LEFT_LCD_CS, HIGH);
+  digitalWrite(DO_RIGHT_LCD_CS, HIGH);
+
   Wire.begin();
 
   lcd.createChar(CHAR_FULL_BAR, full_bar);
@@ -153,11 +190,32 @@ void setup() {
   lcd.print("initializing...");
 
   speedometer_display_7seg.begin(I2C_ADDR_SPEED_DISPLAY);
-  Serial.println("initialized speedometer 7seg");
   tachometer_display_7seg.begin(I2C_ADDR_TACH_DISPLAY);
-  Serial.println("initialized tachometer 7seg");
 
   last_dispatch_time = millis();
+  last_eeprom_write_time = millis();
+  mileage.as_int = EEPROM.read(0x00) | 
+    (EEPROM.read(0x01) << 8) |
+    (EEPROM.read(0x02) << 16) | 
+    (EEPROM.read(0x03) << 24);
+  
+  last_odometer_read_time_ms = millis();
+  attachInterrupt(digitalPinToInterrupt(DI_ODOMETER_PIN), countOdometer, CHANGE);
+}
+
+
+void countOdometer() {
+  odometer_pulses += 1;
+}
+
+uint16_t readAndClearOdometerPulses(long current_cycle_time_ms, long *time_since_last_read_ms) {
+  *time_since_last_read_ms = current_cycle_time_ms - last_odometer_read_time_ms;
+
+  last_odometer_read_time_ms = current_cycle_time_ms;
+  uint16_t to_return = odometer_pulses;
+  odometer_pulses = 0;
+
+  return to_return;
 }
 
 // Provide vehicle speed in km/hr, and engine speed in RPM
@@ -190,8 +248,8 @@ uint16_t battery_state_of_charge_decipct = 1000;  // "decipercent"
 uint16_t battery_summary_voltage_v;
 uint16_t battery_summary_current_a;
 uint16_t battery_summary_temperature_c;
-uint16_t battery_max_pack_voltage_v;
-uint16_t battery_min_pack_voltage_v;
+uint16_t battery_max_pack_voltage_v = 3800;
+uint16_t battery_min_pack_voltage_v = 2700;
 uint16_t battery_max_pack_temp_c;
 uint16_t battery_min_pack_temp_c;
 
@@ -202,10 +260,10 @@ bool unpackBMSCAN(uint32_t message_id, uint8_t len, uint8_t buf[]) {
     return true;
 
   } else if (message_id == CAN_ID_BATT_LOWS_AND_HIS) { 
-    battery_min_pack_voltage_v = buf[0] | (buf[1] << 8);
-    battery_max_pack_voltage_v = buf[2] | (buf[3] << 8);
-    battery_min_pack_temp_c = buf[4] | (buf[5] << 8);
-    battery_max_pack_temp_c = buf[6] | (buf[7] << 8);
+    battery_max_pack_voltage_v = buf[0] | (buf[1] << 8);
+    battery_min_pack_voltage_v = buf[2] | (buf[3] << 8);
+    battery_max_pack_temp_c = buf[4] | (buf[5] << 8);
+    battery_min_pack_temp_c = buf[6] | (buf[7] << 8);
     return true;
 
   } else if (message_id == CAN_ID_BATT_STATUS) {
@@ -282,17 +340,22 @@ void writeLCD() {
       lcd.write(CHAR_EMPTY_BAR);
     }
   }
+
+  // display odometer 
+  lcd.setCursor(0, 2);
+  lcd.print("Odo : ");
+  lcd.print(mileage.as_float);
 }
 
 void writeBatteryTFT() {
-  digitalWrite(DO_LEFT_LCD_CS, HIGH);
+  digitalWrite(DO_LEFT_LCD_CS, LOW);
   delay(1);
   SPITransfer16(battery_max_pack_voltage_v, 5);
   SPITransfer16(battery_min_pack_voltage_v, 5);
   SPITransfer16(battery_max_pack_temp_c, 5);
   SPITransfer16(battery_min_pack_temp_c, 5);
   delay(1);
-  digitalWrite(DO_LEFT_LCD_CS, LOW);
+  digitalWrite(DO_LEFT_LCD_CS, HIGH);
 }
 
 void writeVehicleStatusTFT() {
@@ -315,13 +378,15 @@ void writeVehicleStatusTFT() {
 }
 
 void loop() {
+  current_cycle_time = millis();
+
+  // process all inputs
+  // first, process whatever might have come over from the CAN bus.
+  //
   uint32_t id; 
   uint8_t len; 
   uint8_t ret;
   uint8_t buf[24];
-
-  // process all inputs
-  // first, process whatever might have come over from the CAN bus.
   if (!digitalRead(INT_EV)) {
     ret = ev_can.readMsgBuf(&id, &len, buf);
     if (ret != CAN_OK) {
@@ -332,8 +397,6 @@ void loop() {
     }
   }
 
-  // vehicle speed
-  int vehicle_speed_raw = analogRead(AI_VSS);
   // a bunch of discrete inputs (wonder if these could be 
   // replaced with actual hardware and some bulbs)
   bool status_brake_warning = digitalRead(DI_BRAKE_WARNING);
@@ -352,7 +415,11 @@ void loop() {
   writeBatteryTFT();
   writeVehicleStatusTFT();
 
-  speedometer_display_7seg.print(vehicle_speed_raw, DEC);
+  long time_since_last_odometer_read_ms;
+  uint16_t pulses = readAndClearOdometerPulses(current_cycle_time, &time_since_last_odometer_read_ms);
+  float vehicle_speed = ((float)pulses / (float)time_since_last_odometer_read_ms * 1000.0) * SPEED_CONVERSION_FACTOR;
+  mileage.as_float += (SPEED_CONVERSION_FACTOR * pulses) / 3600.0;
+  speedometer_display_7seg.print((int)vehicle_speed, DEC);
   speedometer_display_7seg.writeDisplay();
   tachometer_display_7seg.print(inverter_motor_speed_rpm, DEC);
   tachometer_display_7seg.writeDisplay();
@@ -366,4 +433,5 @@ void loop() {
   // }
 
   delay(50);
+  previous_cycle_time = current_cycle_time;
 }
