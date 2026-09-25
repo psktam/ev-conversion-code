@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: 2023 Limor Fried for Adafruit Industries
-//
 // SPDX-License-Identifier: MIT
-#include <ESP32SPISlave.h>
-#include <driver/spi_slave.h>
 #include <U8g2lib.h>
 #include <Arduino_GFX_Library.h>
 
@@ -22,27 +19,13 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
 
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
 // 2.1" 480x480 round display
-    480 /* width */, 480 /* height */, rgbpanel, 0 /* rotation */, true /* auto_flush */,
+    480 /* width */, 480 /* height */, rgbpanel, 3 /* rotation */, true /* auto_flush */,
     expander, GFX_NOT_DEFINED /* RST */, TL021WVC02_init_operations, sizeof(TL021WVC02_init_operations));
 
-
-unsigned long runtime;
-uint16_t needle_angle = 0;
-
-void post_setup_cb(spi_slave_transaction_t *t) {
-
-}
-
-void post_transaction_cb(spi_slave_transaction_t *t) {
-
-}
 
 // you know what, fuck it. I'm going to write my own 
 // SPI slave driver because this shit ain't working
 // Fuck ESP32; you made me do this.
-
-esp_err_t err;
-
 // SPI-related stuff
 #define MOSI 7
 #define MISO 6
@@ -58,8 +41,8 @@ bool pin7_status;
 
 uint8_t rxByteCounter = 0;
 uint8_t rxBitCounter = 0;
-uint8_t rx_buf[2] {123, 123};
-uint8_t tx_buf[2] {222, 111};
+#define RX_BUF_SIZE 8
+uint8_t rx_buf[RX_BUF_SIZE] {};
 bool transmissionComplete = false;
 bool prevCSELStatus;
 bool currCSELStatus;
@@ -93,18 +76,14 @@ void setup(void)
   currSCLKStatus = prevSCLKStatus;
   rxBitCounter = 0;
   rxByteCounter = 0;
-  rx_buf[0] = 0;
-  rx_buf[1] = 0;
 
   delay(1000);
 
   gfx->fillScreen(RGB565_BLACK);
+  gfx->setFont(u8g2_font_crox1hb_tf);
 
   expander->pinMode(PCA_TFT_BACKLIGHT, OUTPUT);
   expander->digitalWrite(PCA_TFT_BACKLIGHT, HIGH);
-
-  runtime = millis();
-  drawNeedle(0.0);
 }
 
 
@@ -113,6 +92,7 @@ void loop()
   unsigned long looptime = millis();
   currCSELStatus = digitalRead(CSEL);
   currSCLKStatus = digitalRead(SCLK);
+
   // use the buttons to turn off
   if (! expander->digitalRead(PCA_BUTTON_DOWN)) {
     expander->digitalWrite(PCA_TFT_BACKLIGHT, LOW);
@@ -125,10 +105,11 @@ void loop()
   // SPI state-machine handling
   if (currentSPIState == IDLE) {
     if (!currCSELStatus) {
-      rx_buf[0] = 0;
-      rx_buf[1] = 0;
       rxBitCounter = 0;
       rxByteCounter = 0;
+      for (int i=0; i < RX_BUF_SIZE; i++) {
+        rx_buf[i] = 0;
+      }
       currentSPIState = LISTENING;
       transmissionComplete = false;
     }
@@ -139,7 +120,7 @@ void loop()
     if (currCSELStatus) {
       currentSPIState = IDLE;
       transmissionComplete = true;
-    } else if ((rxByteCounter < 2) && currSCLKStatus && !prevSCLKStatus) {
+    } else if ((rxByteCounter < RX_BUF_SIZE) && currSCLKStatus && !prevSCLKStatus) {
       bool newBit = digitalRead(MOSI);
       rx_buf[rxByteCounter] += newBit << (7 - rxBitCounter);
       rxBitCounter++;
@@ -150,16 +131,100 @@ void loop()
     }
   }
 
+  // for drawing, 0 degrees points straight to the right, and 
+  // clockwise is the positive direction.
+
+  // drawing battery-related stuff
+  uint16_t maxPackVoltagemV = 0;
+  uint16_t minPackVoltagemV = 0;
+  uint16_t maxPackTempK = 0;
+  uint16_t minPackTempK = 0;
+
   if (transmissionComplete) {
-    needle_angle = (rx_buf[0] << 8) + rx_buf[1];
+
+    maxPackVoltagemV = rx_buf[0] | (rx_buf[1] << 8);
+    minPackVoltagemV = rx_buf[2] | (rx_buf[3] << 8);
+    maxPackTempK = rx_buf[4] | (rx_buf[5] << 8);
+    minPackTempK = rx_buf[6] | (rx_buf[7] << 8);
     transmissionComplete = false;
 
+    float battScaleMax = 4.280;
+    float battScaleMin = 3.200;
+
+    float minBattAngle = scaleQuantity(
+        (float)minPackVoltagemV * 0.001,
+        battScaleMin,
+        battScaleMax,
+        60.0,
+        -60.0,
+        true
+        );
+    float maxBattAngle = scaleQuantity(
+        (float)maxPackVoltagemV * 0.001,
+        battScaleMin,
+        battScaleMax,
+        60.0, 
+        -60.0,
+        true
+        );
+
+    float tempScaleMin = -10;
+    float tempScaleMax = 50;
+    float minTempAngle = scaleQuantity(
+        (float)(minPackTempK - 273),
+        tempScaleMin,
+        tempScaleMax,
+        120.0,
+        -120.0,
+        false
+    );
+    float maxTempAngle = scaleQuantity(
+        (float)(maxPackTempK - 273),
+        tempScaleMin,
+        tempScaleMax,
+        120.0, 
+        -120.0,
+        false
+    );
+
     gfx->fillScreen(RGB565_BLACK);
-    drawNeedle(needle_angle);
+    
+    char caption[15] = "";
+    memset(caption, 0, sizeof(caption));
+    formatBatteryVoltage(caption, true, minPackVoltagemV);
+    drawNeedle(
+        minBattAngle, caption, 
+        color_for_value(minPackVoltagemV, 3300, 3400, 4100, 4200)
+    );
+
+    memset(caption, 0, sizeof(caption));
+    formatBatteryVoltage(caption, false, maxPackVoltagemV);
+    drawNeedle(
+        maxBattAngle, caption,
+        color_for_value(maxPackVoltagemV, 3300, 3400, 4100, 4200)
+    );
+
+    memset(caption, 0, sizeof(caption));
+    formatBatteryTemperature(caption, true, (int16_t)minPackTempK - 273);
+    drawNeedle(
+        minTempAngle, caption,
+        color_for_value(minPackTempK, 0 + 273, 15 + 273, 27 + 273, 45 + 273)
+    );
+
+    memset(caption, 0, sizeof(caption));
+    formatBatteryTemperature(caption, false, (int16_t)maxPackTempK - 273);
+    drawNeedle(
+        maxTempAngle, caption,
+        color_for_value(maxPackTempK, 0 + 273, 15 + 273, 27 + 273, 45 + 273)
+    );
   }
 
   prevCSELStatus = currCSELStatus;
   prevSCLKStatus = currSCLKStatus;
+}
+
+float clamp(float value, float minValue, float maxValue) {
+  return min(max(value, minValue), maxValue);
 }
 
 void printBits(uint8_t n) {
@@ -176,7 +241,83 @@ void printBits(uint8_t n) {
   }
 }
 
-void drawNeedle(float needleAngle) {
+
+float scaleQuantity(
+    float value, 
+    float minValue, 
+    float maxValue, 
+    float minAngle,
+    float maxAngle,
+    bool invertRotation) {
+
+
+  value = clamp(value, minValue, maxValue);
+  float angleDelta = maxAngle - minAngle;
+  if (invertRotation == (minAngle < maxAngle)) {
+    // this means we cross 180 at some point
+    angleDelta += 360.0;
+  }
+  float angle = (value - minValue) / (maxValue - minValue) * angleDelta + minAngle;
+  return std::fmod(angle + 180.0, 360.0) - 180.0;
+}
+
+void formatBatteryVoltage(char* buffer, bool isMin, uint16_t voltagemV) {
+  if (isMin) {
+    buffer[0] = 'M';
+    buffer[1] = 'i';
+    buffer[2] = 'n';
+    buffer[3] = ':';
+    buffer[4] = ' ';
+  } else {
+    buffer[0] = 'M';
+    buffer[1] = 'a';
+    buffer[2] = 'x';
+    buffer[3] = ':';
+    buffer[4] = ' ';
+  }
+
+  buffer[5] = 48 + (voltagemV / 1000);
+  buffer[6] = '.';
+  buffer[7] = 48 + ((voltagemV % 1000) / 100);
+  buffer[8] = 48 + ((voltagemV % 100) / 10);
+  buffer[9] = 48 + (voltagemV % 10);
+  buffer[10] = ' ';
+  buffer[11] = 'V';
+}
+
+
+void formatBatteryTemperature(char* buffer, bool isMin, int16_t temp_c) {
+  if (isMin) {
+    buffer[0] = 'M';
+    buffer[1] = 'i';
+    buffer[2] = 'n';
+    buffer[3] = ':';
+    buffer[4] = ' ';
+  } else {
+    buffer[0] = 'M';
+    buffer[1] = 'a';
+    buffer[2] = 'x';
+    buffer[3] = ':';
+    buffer[4] = ' ';
+  }
+
+  int idx = 5;
+  if (temp_c < 0) {
+    temp_c = -temp_c;
+    buffer[5] = '-';
+    idx = 6;
+  }
+
+  if ((temp_c / 10) != 0) {
+    buffer[idx++] = 48 + (temp_c / 10);
+  }
+  buffer[idx++] = 48 + (temp_c % 10);
+  buffer[idx++] = ' ';
+  buffer[idx++] = 'C';
+}
+
+
+void drawNeedle(float needleAngle, char* caption, uint16_t color) {
 
     float angle_x = cos(needleAngle/ 180.0 * M_PI);
     float angle_y = sin(needleAngle/ 180.0 * M_PI);
@@ -193,11 +334,29 @@ void drawNeedle(float needleAngle) {
 
     int16_t angle_as_int = needleAngle;
 
-    gfx->setCursor(text_x, text_y);
-    gfx->setFont(u8g2_font_crox1hb_tf);
-    gfx->print("max voltage: ");
-    gfx->println(angle_as_int);
+    for (int x_offset = -2; x_offset < 3; x_offset++) {
+      for (int y_offset = -2; y_offset < 3; y_offset++) {
+        gfx->drawLine(
+            240 + x_offset, 240 + y_offset, 
+            tip_x + x_offset, tip_y + y_offset, 
+            color);
+      }
+    }
 
-    gfx->drawLine(240, 240, tip_x, tip_y, 0xffff);
+    gfx->setCursor(text_x, text_y);
+    gfx->println(caption);
+}
+
+uint16_t color_for_value(
+    uint16_t val, 
+    uint16_t danger_low, uint16_t warn_low, 
+    uint16_t warn_high, uint16_t danger_high
+) {
+  if ((val < danger_low) || (val > danger_high)) {
+    return 0xf00f;
+  } else if ((val < warn_low) || (val > warn_high)) {
+    return 0xfe0f;
+  } 
+  return 0xffff;
 }
 
