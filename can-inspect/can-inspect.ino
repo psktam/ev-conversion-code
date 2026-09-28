@@ -21,19 +21,18 @@ const int INT_EV = 49;
 const int SPI_CS_EV = 53;
 const int TFT_SCK = 24;
 const int TFT_MOSI = 25;
+
+const int DI_KEY_SWITCH = 45;
+
 // pullups
-const int DI_BRAKE_WARNING = 1;
-const int DI_12V_BATT_WARNING = 2;
-const int DI_ABS_WARNING = 3;
-const int DI_SEAT_BELTS = 4;
-// pulldowns
-const int DI_HI_BEAM = 5;
-// Pullups
-const int DI_FL_DOOR_WARNING = 8; 
-const int DI_FR_DOOR_WARNING = 9;
-const int DI_RL_DOOR_WARNING = 10;
-const int DI_RR_DOOR_WARNING = 11;
-const int DI_TAILGATE_WARNING = 12;
+const int DI_ABS_WARNING = 36;
+const int DI_SEAT_BELTS = 22;
+const int DI_HI_BEAM = 38;
+const int DI_FL_DOOR_WARNING = 32; 
+const int DI_FR_DOOR_WARNING = 4;
+const int DI_RL_DOOR_WARNING = 30;
+const int DI_RR_DOOR_WARNING = 7;
+const int DI_TAILGATE_WARNING = 6;
 
 // some SPI configuration
 const int DO_LEFT_LCD_CS = 27;
@@ -60,14 +59,10 @@ unsigned long last_dispatch_time = 0;
 long current_cycle_time;
 long previous_cycle_time;
 
-union M {
- uint32_t as_int;
- float as_float;
-};
+float mileage;
+float vehicle_speed;
 
 const int DI_ODOMETER_PIN = 2;
-M mileage;
-long last_eeprom_write_time = 0;
 volatile uint16_t odometer_pulses = 0;
 long last_odometer_read_time_ms;
 
@@ -153,16 +148,16 @@ void setup() {
     Serial.println("error initializing CAN");
   }
 
-  pinMode(DI_BRAKE_WARNING, INPUT);
-  pinMode(DI_12V_BATT_WARNING, INPUT);
-  pinMode(DI_ABS_WARNING, INPUT);
-  pinMode(DI_SEAT_BELTS, INPUT);
-  pinMode(DI_HI_BEAM, INPUT);
-  pinMode(DI_FL_DOOR_WARNING, INPUT);
-  pinMode(DI_FR_DOOR_WARNING, INPUT);
-  pinMode(DI_RL_DOOR_WARNING, INPUT);
-  pinMode(DI_RR_DOOR_WARNING, INPUT);
-  pinMode(DI_TAILGATE_WARNING, INPUT);
+  pinMode(DI_KEY_SWITCH, INPUT);
+
+  pinMode(DI_ABS_WARNING, INPUT_PULLUP);
+  pinMode(DI_SEAT_BELTS, INPUT_PULLUP);
+  pinMode(DI_HI_BEAM, INPUT_PULLUP);
+  pinMode(DI_FL_DOOR_WARNING, INPUT_PULLUP);
+  pinMode(DI_FR_DOOR_WARNING, INPUT_PULLUP);
+  pinMode(DI_RL_DOOR_WARNING, INPUT_PULLUP);
+  pinMode(DI_RR_DOOR_WARNING, INPUT_PULLUP);
+  pinMode(DI_TAILGATE_WARNING, INPUT_PULLUP);
   pinMode(AI_VSS, INPUT);
 
   pinMode(DO_LCD_RS, OUTPUT);
@@ -191,14 +186,11 @@ void setup() {
 
   speedometer_display_7seg.begin(I2C_ADDR_SPEED_DISPLAY);
   tachometer_display_7seg.begin(I2C_ADDR_TACH_DISPLAY);
+  tachometer_display_7seg.setDisplayState(true);
+  // speedometer_display_7seg.setBrightness(15);
 
   last_dispatch_time = millis();
-  last_eeprom_write_time = millis();
-  mileage.as_int = EEPROM.read(0x00) | 
-    (EEPROM.read(0x01) << 8) |
-    (EEPROM.read(0x02) << 16) | 
-    (EEPROM.read(0x03) << 24);
-  
+  EEPROM.get(0x00, mileage);
   last_odometer_read_time_ms = millis();
   attachInterrupt(digitalPinToInterrupt(DI_ODOMETER_PIN), countOdometer, CHANGE);
 }
@@ -248,10 +240,10 @@ uint16_t battery_state_of_charge_decipct = 1000;  // "decipercent"
 uint16_t battery_summary_voltage_v;
 uint16_t battery_summary_current_a;
 uint16_t battery_summary_temperature_c;
-uint16_t battery_max_pack_voltage_v = 3800;
-uint16_t battery_min_pack_voltage_v = 2700;
-uint16_t battery_max_pack_temp_c;
-uint16_t battery_min_pack_temp_c;
+uint16_t battery_max_pack_voltage_v = 3450;
+uint16_t battery_min_pack_voltage_v = 4120;
+uint16_t battery_max_pack_temp_c = 273 + 30;
+uint16_t battery_min_pack_temp_c = 273 - 5;
 
 
 bool unpackBMSCAN(uint32_t message_id, uint8_t len, uint8_t buf[]) {
@@ -275,7 +267,7 @@ bool unpackBMSCAN(uint32_t message_id, uint8_t len, uint8_t buf[]) {
   return false;
 }
 
-int16_t inverter_motor_speed_rpm = 5000; // [-32768, 32767] <-> [-32768, 32767]
+int16_t inverter_motor_speed_rpm; // [-32768, 32767] <-> [-32768, 32767]
 uint8_t inverter_motor_temp_c; // [0, 255] <-> [-40, 215]
 uint8_t inverter_temp_1_c; // [0, 255] <-> [-40, 215]
 int16_t inverter_motor_current_arms; // [-32768, 32767] <-> [-3276.8, 3276.7]
@@ -285,6 +277,15 @@ uint8_t inverter_worst_fault_code = 0;
 uint8_t inverter_worst_fault_level = 0;
 uint32_t inverter_odometer = 0;
 
+bool prev_keyswitch_state = false;
+bool status_abs_warning = true;
+bool status_seat_belts = true;
+bool status_hi_beam = true;
+bool status_fl_door_warning = true;
+bool status_fr_door_warning = true;
+bool status_rl_door_warning = true;
+bool status_rr_door_warning = true;
+bool status_tailgate_warning = true;
 
 bool unpackInverterCAN(uint32_t message_id, uint8_t len, uint8_t buf[]) {
   if (message_id == CAN_ID_INVERTER_DATA) {
@@ -344,7 +345,11 @@ void writeLCD() {
   // display odometer 
   lcd.setCursor(0, 2);
   lcd.print("Odo : ");
-  lcd.print(mileage.as_float);
+  lcd.print(mileage);
+
+  lcd.setCursor(0, 3);
+  lcd.print("speed: ");
+  lcd.print(vehicle_speed);
 }
 
 void writeBatteryTFT() {
@@ -359,22 +364,20 @@ void writeBatteryTFT() {
 }
 
 void writeVehicleStatusTFT() {
-  // uint16_t status = status_brake_warning | 
-  //   (status_12v_batt_warning << 1) | 
-  //   (status_abs_warning << 2) |
-  //   (status_seat_belts << 3) | 
-  //   (status_hi_beam << 4) |
-  //   (status_fl_door_warning << 5) |
-  //   (status_fr_door_warning << 6) | 
-  //   (status_rl_door_warning << 7) | 
-  //   (status_rr_door_warning << 8) | 
-  //   (status_tailgate_warning << 9);
-  //
-  // digitalWrite(DO_RIGHT_LCD_CS, HIGH);
-  // delay(1);
-  // SPITransfer16(status, 5);
-  // delay(1);
-  // digitalWrite(DO_RIGHT_LCD_CS, LOW);
+  uint8_t status = status_abs_warning |
+    (status_seat_belts << 1) | 
+    (status_hi_beam << 2) |
+    (status_fl_door_warning << 3) |
+    (status_fr_door_warning << 4) | 
+    (status_rl_door_warning << 5) | 
+    (status_rr_door_warning << 6) | 
+    (status_tailgate_warning << 7);
+
+  digitalWrite(DO_RIGHT_LCD_CS, LOW);
+  delay(1);
+  SPITransfer(status, 5);
+  delay(1);
+  digitalWrite(DO_RIGHT_LCD_CS, HIGH);
 }
 
 void loop() {
@@ -399,16 +402,14 @@ void loop() {
 
   // a bunch of discrete inputs (wonder if these could be 
   // replaced with actual hardware and some bulbs)
-  bool status_brake_warning = digitalRead(DI_BRAKE_WARNING);
-  bool status_12v_batt_warning = digitalRead(DI_12V_BATT_WARNING);
-  bool status_abs_warning = digitalRead(DI_ABS_WARNING);
-  bool status_seat_belts = digitalRead(DI_SEAT_BELTS);
-  bool status_hi_beam = digitalRead(DI_HI_BEAM);
-  bool status_fl_door_warning = digitalRead(DI_FL_DOOR_WARNING);
-  bool status_fr_door_warning = digitalRead(DI_FR_DOOR_WARNING);
-  bool status_rl_door_warning = digitalRead(DI_RL_DOOR_WARNING);
-  bool status_rr_door_warning = digitalRead(DI_RR_DOOR_WARNING);
-  bool status_tailgate_warning = digitalRead(DI_TAILGATE_WARNING);
+  status_abs_warning = !digitalRead(DI_ABS_WARNING);
+  status_seat_belts = !digitalRead(DI_SEAT_BELTS);
+  status_hi_beam = !digitalRead(DI_HI_BEAM);
+  status_fl_door_warning = !digitalRead(DI_FL_DOOR_WARNING);
+  status_fr_door_warning = !digitalRead(DI_FR_DOOR_WARNING);
+  status_rl_door_warning = !digitalRead(DI_RL_DOOR_WARNING);
+  status_rr_door_warning = !digitalRead(DI_RR_DOOR_WARNING);
+  status_tailgate_warning = !digitalRead(DI_TAILGATE_WARNING);
 
   // Now we send and set the outputs
   writeLCD();
@@ -417,21 +418,28 @@ void loop() {
 
   long time_since_last_odometer_read_ms;
   uint16_t pulses = readAndClearOdometerPulses(current_cycle_time, &time_since_last_odometer_read_ms);
-  float vehicle_speed = ((float)pulses / (float)time_since_last_odometer_read_ms * 1000.0) * SPEED_CONVERSION_FACTOR;
-  mileage.as_float += (SPEED_CONVERSION_FACTOR * pulses) / 3600.0;
+  vehicle_speed = ((float)pulses / (float)time_since_last_odometer_read_ms * 1000.0) * SPEED_CONVERSION_FACTOR;
+  mileage += (SPEED_CONVERSION_FACTOR * pulses) / 3600.0;
   speedometer_display_7seg.print((int)vehicle_speed, DEC);
   speedometer_display_7seg.writeDisplay();
   tachometer_display_7seg.print(inverter_motor_speed_rpm, DEC);
   tachometer_display_7seg.writeDisplay();
 
   // Send info to CAN pump every 10ms or so
-  // if (millis() - last_dispatch_time > 10) {
-  //   Serial.println("dispatched message to PS Pump");
-  //   convert_513_values(500, 0, buf);
-  //   ev_can.sendMsgBuf(513, 0, 8, buf);
-  //   last_dispatch_time = millis();
-  // }
+  if (millis() - last_dispatch_time > 10) {
+    convert_513_values(500, 0, buf);
+    ev_can.sendMsgBuf(513, 0, 8, buf);
+    last_dispatch_time = millis();
+  }
 
   delay(50);
+  bool current_keyswitch_state = digitalRead(DI_KEY_SWITCH);
+
+  if (!current_keyswitch_state && prev_keyswitch_state) {
+    // this is our signal to write to EEPROM
+    EEPROM.put(0x00, mileage);
+  }
+
   previous_cycle_time = current_cycle_time;
+  prev_keyswitch_state = current_keyswitch_state;
 }
