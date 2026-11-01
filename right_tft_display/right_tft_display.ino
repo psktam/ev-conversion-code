@@ -40,16 +40,16 @@ bool pin5_status;
 bool pin6_status;
 bool pin7_status;
 
-uint8_t rxByteCounter = 0;
-uint8_t rxBitCounter = 0;
+volatile uint8_t rxByteCounter = 0;
+volatile uint8_t rxBitCounter = 0;
 #define RX_BUF_SIZE 8
-uint8_t rx_buf[RX_BUF_SIZE] {};
-bool transmissionComplete = false;
+volatile uint8_t rx_buf[RX_BUF_SIZE] {};
+volatile bool transmissionComplete = false;
 bool prevCSELStatus;
 bool currCSELStatus;
 bool prevSCLKStatus;
 bool currSCLKStatus;
-SPIState currentSPIState;
+volatile SPIState currentSPIState;
 
 bool status_batt_12v;
 bool status_abs_warning;
@@ -70,61 +70,89 @@ void drawChassis() {
     gfx->drawRoundRect(180 + offset, 149 + offset, 119 - 2 * offset, 40 - 2 * offset, max(5 - offset, 0), 0xfe0f);
     gfx->drawRoundRect(180 + offset, 240 + offset, 119 - 2 * offset, 120 - 2 * offset, max(5 - offset, 0), 0xfe0f);
   }
-
-  gfx->setCursor(202, 420);
-  gfx->println(rx_buf[0]);
-  gfx->setCursor(202, 440);
-  gfx->println(rx_buf[1]);
-  gfx->setCursor(240, 420);
-  gfx->println(rxByteCounter);
-  gfx->setCursor(240, 440);
-  gfx->println(rxBitCounter);
 }
 
 void drawFlags() {
-  if (status_tailgate) {
-    for (int i = 0; i < 10; i++) {
-      gfx->drawFastHLine(202, 383 + i, 74, 0xf00f);
-    }
+  uint16_t color;
+  color = status_tailgate ? RGB565_RED : RGB565_BLACK;
+  for (int i = 0; i < 10; i++) {
+    gfx->drawFastHLine(202, 383 + i, 74, color);
   }
 
-  if (status_fl_door) {
-    for (int i = 0; i < 10; i++) {
-      gfx->drawLine(88 + i, 240 + i, 141 + i, 187 + i, 0xf00f);
-    }
+  color = status_fl_door ? RGB565_RED : RGB565_BLACK;
+  for (int i = 0; i < 10; i++) {
+    gfx->drawLine(88 + i, 240 + i, 141 + i, 187 + i, color);
   }
 
-  if (status_rl_door) {
-    for (int i = 0; i < 10; i++) {
-      gfx->drawLine(88 + i, 293 + i, 141 + i, 240 + i, 0xf00f);
-    }
+  color = status_rl_door ? RGB565_RED : RGB565_BLACK;
+  for (int i = 0; i < 10; i++) {
+    gfx->drawLine(88 + i, 293 + i, 141 + i, 240 + i, color);
   }
 
-  if (status_fr_door) {
-    for (int i = 0; i < 10; i++) {
-      gfx->drawLine(337 - i, 187+ i, 390 - i, 240 + i, 0xf00f);
-    }
+  color = status_fr_door ? RGB565_RED : RGB565_BLACK;
+  for (int i = 0; i < 10; i++) {
+    gfx->drawLine(337 - i, 187+ i, 390 - i, 240 + i, color);
   }
 
-  if (status_rr_door) {
-    for (int i = 0; i < 10; i++) {
-      gfx->drawLine(337 - i, 240 + i, 390 - i, 293 + i, 0xf00f);
-    }
+  color = status_rr_door ? RGB565_RED : RGB565_BLACK;
+  for (int i = 0; i < 10; i++) {
+    gfx->drawLine(337 - i, 240 + i, 390 - i, 293 + i, color);
   }
 
-  if (status_hi_beam) {
-    gfx->fillTriangle(
+  color = status_hi_beam ? RGB565_BLUE : RGB565_BLACK;
+  gfx->fillTriangle(
       172, 40,
       222, 40,
       197, 97,
-      0x09ff
-    );
-    gfx->fillTriangle(
-        258, 40,
-        308, 40,
-        283,  97,
-        0x09ff
-    );
+      color 
+  );
+  gfx->fillTriangle(
+      258, 40,
+      308, 40,
+      283,  97,
+      color 
+  );
+}
+
+
+void IRAM_ATTR onCSLow() {
+  if (currentSPIState == IDLE) {
+    rxBitCounter = 0;
+    rxByteCounter = 0;
+    for (int i = 0; i < RX_BUF_SIZE; i++) {
+      rx_buf[i] = 0;
+    }
+    currentSPIState = LISTENING;
+    transmissionComplete = false;
+  }
+}
+
+void IRAM_ATTR onCSHigh() {
+  if (currentSPIState == LISTENING) {
+    currentSPIState = IDLE;
+    transmissionComplete = true;
+  }
+}
+
+void IRAM_ATTR onCSChange() {
+  if (digitalRead(CSEL)) {
+    onCSHigh();
+  } else {
+    onCSLow();
+  }
+}
+
+void IRAM_ATTR onSCLKHigh() {
+  if ((currentSPIState != LISTENING) || (rxByteCounter >= RX_BUF_SIZE)) {
+    return;
+  }
+
+  bool newBit = digitalRead(MOSI);
+  rx_buf[rxByteCounter] += newBit << (7 - rxBitCounter);
+  rxBitCounter++;
+  if (rxBitCounter == 8) {
+    rxBitCounter = 0;
+    rxByteCounter++;
   }
 }
 
@@ -153,6 +181,9 @@ void setup(void)
   pinMode(CSEL, INPUT);
   pinMode(SCLK, INPUT);
   digitalWrite(MISO, LOW);
+
+  attachInterrupt(CSEL, onCSChange, CHANGE);
+  attachInterrupt(SCLK, onSCLKHigh, RISING);
 
   prevCSELStatus = digitalRead(CSEL);
   currCSELStatus = prevCSELStatus;
@@ -186,79 +217,20 @@ void loop()
     expander->digitalWrite(PCA_TFT_BACKLIGHT, HIGH);
   }
 
-  // SPI state-machine handling
-  if (currentSPIState == IDLE) {
-    if (!currCSELStatus) {
-      rxBitCounter = 0;
-      rxByteCounter = 0;
-      for (int i = 0; i < RX_BUF_SIZE; i++) {
-        rx_buf[i] = 0;
-      }
-      currentSPIState = LISTENING;
-      transmissionComplete = false;
-    }
-  } else if (currentSPIState == LISTENING) {
-    if (currCSELStatus) {
-      currentSPIState = IDLE;
-      transmissionComplete = true;
-    } else if ((rxByteCounter < RX_BUF_SIZE) && currSCLKStatus && !prevSCLKStatus) {
-      bool newBit = digitalRead(MOSI);
-      rx_buf[rxByteCounter] += newBit << (7 - rxBitCounter);
-      rxBitCounter++;
-      if (rxBitCounter == 8) {
-        rxBitCounter = 0;
-        rxByteCounter++;
-      }
-    }
-  }
-
   if (transmissionComplete) {
-    status_batt_12v =    rx_buf[0] & 1;
-    status_abs_warning = rx_buf[0] & (1 << 1);
-    status_seat_belts =  rx_buf[0] & (1 << 2);
-    status_hi_beam =     rx_buf[0] & (1 << 3);
-    status_fl_door =     rx_buf[0] & (1 << 4);
-    status_fr_door =     rx_buf[0] & (1 << 5);
-    status_rl_door =     rx_buf[0] & (1 << 6);
-    status_rr_door =     rx_buf[0] & (1 << 7);
-    status_tailgate =    rx_buf[1] & 1;
+    status_abs_warning = rx_buf[0] & 1;
+    status_seat_belts =  rx_buf[0] & (1 << 1);
+    status_hi_beam =     rx_buf[0] & (1 << 2);
+    status_fl_door =     rx_buf[0] & (1 << 3);
+    status_fr_door =     rx_buf[0] & (1 << 4);
+    status_rl_door =     rx_buf[0] & (1 << 5);
+    status_rr_door =     rx_buf[0] & (1 << 6);
+    status_tailgate =    rx_buf[0] & (1 << 7);
     transmissionComplete = false;
 
-    gfx->fillScreen(0x0000);
-    drawChassis();
     drawFlags();
   }
 
   prevSCLKStatus = currSCLKStatus;
-}
-
-// https://chat.openai.com/share/8edee522-7875-444f-9fea-ae93a8dfa4ec
-void generateColorWheel(uint16_t *colorWheel) {
-  int width = gfx->width();
-  int height = gfx->height();
-  int half_width = width / 2;
-  int half_height = height / 2;
-  float angle;
-  uint8_t r, g, b;
-  int index, scaled_index;
-
-  for(int y = 0; y < half_height; y++) {
-    for(int x = 0; x < half_width; x++) {
-      index = y * half_width + x;
-      angle = atan2(y - half_height / 2, x - half_width / 2);
-      r = uint8_t(127.5 * (cos(angle) + 1));
-      g = uint8_t(127.5 * (sin(angle) + 1));
-      b = uint8_t(255 - (r + g) / 2);
-      uint16_t color = RGB565(r, g, b);
-
-      // Scale this pixel into 4 pixels in the full buffer
-      for(int dy = 0; dy < 2; dy++) {
-        for(int dx = 0; dx < 2; dx++) {
-          scaled_index = (y * 2 + dy) * width + (x * 2 + dx);
-          colorWheel[scaled_index] = color;
-        }
-      }
-    }
-  }
 }
 
