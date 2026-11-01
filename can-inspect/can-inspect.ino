@@ -7,7 +7,6 @@
 #include <EEPROM.h>
 #include <Wire.h>
 #include <LiquidCrystal.h>
-#include "manual_spi.hpp"
 
 #define CAN_ID_BATT_SOC 853
 #define CAN_ID_BATT_LOWS_AND_HIS 883
@@ -135,8 +134,6 @@ uint16_t SPITransfer16(uint16_t data, uint8_t cyc_ms) {
   return SPITransfer(data & 0xff, cyc_ms) | (SPITransfer(data >> 8, cyc_ms) << 8);
 }
 
-ManualSPI mspi(TFT_SCK, TFT_MOSI, 5);
-
 void setup() {
   current_cycle_time = millis();
   previous_cycle_time = current_cycle_time;
@@ -181,7 +178,6 @@ void setup() {
   digitalWrite(DO_RIGHT_LCD_CS, HIGH);
 
   Wire.begin();
-  mspi.init();
 
   lcd.createChar(CHAR_FULL_BAR, full_bar);
   lcd.createChar(CHAR_EMPTY_BAR, empty_bar);
@@ -357,17 +353,14 @@ void writeLCD() {
 }
 
 void writeBatteryTFT() {
-  uint8_t message[8] = {
-    battery_max_pack_voltage_v & 0xff,
-    (battery_max_pack_voltage_v >> 8) & 0xff,
-    battery_min_pack_voltage_v & 0xff,
-    (battery_min_pack_voltage_v >> 8) & 0xff,
-    battery_max_pack_temp_c & 0xff,
-    (battery_max_pack_temp_c >> 8) & 0xff,
-    battery_min_pack_temp_c & 0xff,
-    (battery_min_pack_temp_c >> 8) & 0xff
-  };
-  mspi.queue_message(message, 8, DO_LEFT_LCD_CS);
+  digitalWrite(DO_LEFT_LCD_CS, LOW);
+  delay(1);
+  SPITransfer16(battery_max_pack_voltage_v, 5);
+  SPITransfer16(battery_min_pack_voltage_v, 5);
+  SPITransfer16(battery_max_pack_temp_c, 5);
+  SPITransfer16(battery_min_pack_temp_c, 5);
+  delay(1);
+  digitalWrite(DO_LEFT_LCD_CS, HIGH);
 }
 
 void writeVehicleStatusTFT() {
@@ -420,10 +413,7 @@ void loop() {
 
   // Now we send and set the outputs
   writeLCD();
-
-  if (mspi.ready_for_send()) {
-    writeBatteryTFT();
-  }
+  writeBatteryTFT();
   writeVehicleStatusTFT();
 
   long time_since_last_odometer_read_ms;
@@ -442,7 +432,6 @@ void loop() {
     last_dispatch_time = millis();
   }
 
-  mspi.run();
   delay(50);
   bool current_keyswitch_state = digitalRead(DI_KEY_SWITCH);
 

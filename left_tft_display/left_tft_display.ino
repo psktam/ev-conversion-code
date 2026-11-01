@@ -19,7 +19,7 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
 
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
 // 2.1" 480x480 round display
-    480 /* width */, 480 /* height */, rgbpanel, 3 /* rotation */, true /* auto_flush */,
+    480 /* width */, 480 /* height */, rgbpanel, 3 /* rotation */, false /* auto_flush */,
     expander, GFX_NOT_DEFINED /* RST */, TL021WVC02_init_operations, sizeof(TL021WVC02_init_operations));
 
 
@@ -39,24 +39,115 @@ bool pin5_status;
 bool pin6_status;
 bool pin7_status;
 
-uint8_t rxByteCounter = 0;
-uint8_t rxBitCounter = 0;
+volatile uint8_t rxByteCounter = 0;
+volatile uint8_t rxBitCounter = 0;
 #define RX_BUF_SIZE 8
-uint8_t rx_buf[RX_BUF_SIZE] {};
-bool transmissionComplete = false;
+volatile uint8_t rx_buf[RX_BUF_SIZE] {};
+volatile bool transmissionComplete = false;
 bool prevCSELStatus;
 bool currCSELStatus;
 bool prevSCLKStatus;
 bool currSCLKStatus;
-SPIState currentSPIState;
+volatile SPIState currentSPIState;
+
+struct Limits {
+  uint16_t alarmLow;
+  uint16_t warnLow;
+  uint16_t warnHigh;
+  uint16_t alarmHigh;
+};
+
+struct CyclicValue {
+  uint16_t oldValue = 0;
+  uint16_t newValue = 0;
+};
+
+struct GaugeParameters{
+  float gaugeStartAngle;
+  float gaugeEndAngle;
+  float gaugeMinValue;
+  float gaugeMaxValue;
+  bool isClockwise = false;
+};
+
+struct NeedleGraphicsParms {
+  float tip_x;
+  float tip_y;
+  float text_x;
+  float text_y;
+};
+
+GaugeParameters voltageGauge;
+GaugeParameters temperatureGauge;
+Limits packVoltageLimits_mV;
+Limits packTempLimits_K;
+
+CyclicValue maxPackVoltage_mV;
+CyclicValue minPackVoltage_mV;
+CyclicValue maxPackTemp_K;
+CyclicValue minPackTemp_K;
+
+
+void IRAM_ATTR onCSLow() {
+  if (currentSPIState == IDLE) {
+    rxBitCounter = 0;
+    rxByteCounter = 0;
+    for (int i = 0; i < RX_BUF_SIZE; i++) {
+      rx_buf[i] = 0;
+    }
+    currentSPIState = LISTENING;
+    transmissionComplete = false;
+  }
+}
+
+
+void IRAM_ATTR onCSHigh() {
+  // just punt the state machine back to idle
+  if (currentSPIState == LISTENING) {
+    currentSPIState = IDLE;
+    transmissionComplete = true;
+  }
+}
+
+
+void IRAM_ATTR onCSChange() {
+  if (digitalRead(CSEL)) {
+    onCSHigh();
+  } else {
+    onCSLow();
+  }
+}
+
+
+void IRAM_ATTR onSCLKHigh() {
+  if ((currentSPIState != LISTENING) || (rxByteCounter >= RX_BUF_SIZE)) {
+    return;
+  }
+
+  bool newBit = digitalRead(MOSI);
+  rx_buf[rxByteCounter] += newBit << (7 - rxBitCounter);
+  rxBitCounter++;
+  if (rxBitCounter == 8) {
+    rxBitCounter = 0;
+    rxByteCounter++;
+  }
+}
+
+
+void drawCross() {
+  gfx->startWrite();
+  for (int offset = -3; offset < 4; offset++) {
+    gfx->writeFastVLine(240 + offset, 20, 440, RGB565_WHITE);
+    gfx->writeFastHLine(60, 240 + offset, 360, RGB565_WHITE);
+  }
+  gfx->endWrite();
+  gfx->flush();
+}
+
 
 void setup(void)
 {
-#ifdef GFX_EXTRA_PRE_INIT
-  GFX_EXTRA_PRE_INIT();
-#endif
   // Init Display
-
   Wire.setClock(1000000); // speed up I2C
   if (!gfx->begin()) {
     Serial.println("gfx->begin() failed!");
@@ -79,11 +170,206 @@ void setup(void)
 
   delay(1000);
 
+  // attach SPI-related interrupts
+  attachInterrupt(CSEL, onCSChange, CHANGE);
+  attachInterrupt(SCLK, onSCLKHigh, RISING);
+
+  // initialize gauge settings
+  voltageGauge.gaugeStartAngle = 60.0;
+  voltageGauge.gaugeEndAngle = -60.0;
+  voltageGauge.gaugeMinValue = 3200.0;
+  voltageGauge.gaugeMaxValue = 4280.0;
+
+  temperatureGauge.gaugeStartAngle = 120.0;
+  temperatureGauge.gaugeEndAngle = -120.0;
+  temperatureGauge.gaugeMinValue = 273.0 - 10.0;
+  temperatureGauge.gaugeMaxValue = 273.0 + 50.0;
+  temperatureGauge.isClockwise = true;
+
+  packVoltageLimits_mV.alarmLow = 3300;
+  packVoltageLimits_mV.warnLow = 3400;
+  packVoltageLimits_mV.warnHigh = 4100;
+  packVoltageLimits_mV.alarmHigh = 4200;
+
+  packTempLimits_K.alarmLow = 273 + 0;
+  packTempLimits_K.warnLow = 273 + 15;
+  packTempLimits_K.warnHigh = 273 + 27;
+  packTempLimits_K.alarmHigh = 273 + 45;
+
+  // initial drawing
   gfx->fillScreen(RGB565_BLACK);
   gfx->setFont(u8g2_font_crox1hb_tf);
+  drawCross();
 
   expander->pinMode(PCA_TFT_BACKLIGHT, OUTPUT);
   expander->digitalWrite(PCA_TFT_BACKLIGHT, HIGH);
+}
+
+void rotate(CyclicValue &vals) {
+  vals.oldValue = vals.newValue;
+}
+
+
+float calculateAngle(GaugeParameters gauge, float value) {
+  value = clamp(value, gauge.gaugeMinValue, gauge.gaugeMaxValue);
+  float angleDelta = gauge.gaugeEndAngle - gauge.gaugeStartAngle;
+  if (gauge.isClockwise != (gauge.gaugeStartAngle < gauge.gaugeEndAngle)) {
+    angleDelta += 360.0;
+  }
+
+  float angle = (value - gauge.gaugeMinValue) / 
+    (gauge.gaugeMaxValue - gauge.gaugeMinValue) * angleDelta + gauge.gaugeStartAngle;
+  return std::fmod(angle + 180.0, 360.0) - 180.0;
+  // return angle;
+}
+
+
+void calculateAngleGraphicsPositions(float angle, NeedleGraphicsParms &graphixParms) {
+  float x = cos(angle / 180.0 * M_PI);
+  float y = sin(angle / 180.0 * M_PI);
+
+  graphixParms.tip_x = 240 + 240 * x;
+  graphixParms.tip_y = 240 + 240 * y;
+
+  graphixParms.text_x = 240 + 100 * x;
+  graphixParms.text_y = 240 + 100 * y;
+
+  if (((angle > 90) && (angle < 180)) || (angle > 270)) {
+    graphixParms.text_y += 12;
+  }
+}
+
+
+void renderNeedle(GaugeParameters &gauge, Limits &lims, CyclicValue &values) {
+  // first black out where the needle previously was
+  int thickness = 3;
+  NeedleGraphicsParms needle_gfx;
+  float angle = calculateAngle(gauge, values.oldValue);
+  calculateAngleGraphicsPositions(angle, needle_gfx);
+  drawLineImpl(240, 240, needle_gfx.tip_x, needle_gfx.tip_y, thickness, RGB565_BLACK);
+
+  // now draw the line to match its current value
+  angle = calculateAngle(gauge, values.newValue);
+  calculateAngleGraphicsPositions(angle, needle_gfx);
+  drawLineImpl(240, 240, needle_gfx.tip_x, needle_gfx.tip_y, thickness, color_for_value(values.newValue, lims));
+}
+
+
+void renderGauge(
+    GaugeParameters &gauge,
+    Limits &lims, 
+    CyclicValue &topValues, 
+    CyclicValue &botValues
+) {
+    float top_angle_rad = calculateAngle(gauge, topValues.newValue) * M_PI / 180.0;
+    float alarm_high_rad = calculateAngle(gauge, lims.alarmHigh) * M_PI / 180.0;
+    float gauge_top_rad = gauge.gaugeEndAngle * M_PI / 180.0;
+    float warn_high_rad = calculateAngle(gauge, lims.warnHigh) * M_PI / 180.0;
+    float warn_low_rad = calculateAngle(gauge, lims.warnLow) * M_PI / 180.0;
+    float alarm_low_rad = calculateAngle(gauge, lims.alarmLow) * M_PI / 180.0;
+    float low_angle_rad = calculateAngle(gauge, botValues.newValue) * M_PI / 180.0;
+    float gauge_bot_rad = gauge.gaugeStartAngle * M_PI / 180.0;
+
+    Serial.print("top angle: ");
+    Serial.println(top_angle_rad * 180.0 / M_PI);
+    Serial.print("alarm high angle: ");
+    Serial.println(alarm_high_rad * 180.0 / M_PI);
+    Serial.print("warn high angle: ");
+    Serial.println(warn_high_rad * 180.0 / M_PI);
+    Serial.print("warn low angle: ");
+    Serial.println(warn_low_rad * 180.0 / M_PI);
+    Serial.print("alarm low angle: ");
+    Serial.println(alarm_low_rad * 180.0 / M_PI);
+    Serial.print("low angle: ");
+    Serial.println(low_angle_rad * 180.0 / M_PI);
+
+    for (int i = 0; i < 10; i++) {
+      renderArc(
+          240, 240,
+          200 + i,
+          top_angle_rad,
+          low_angle_rad,
+          gauge_top_rad,
+          alarm_high_rad,
+          warn_high_rad,
+          warn_low_rad,
+          alarm_low_rad,
+          gauge_bot_rad,
+          gauge.isClockwise
+      );
+    }
+}
+
+
+void renderArc(
+  uint16_t center_x, 
+  uint16_t center_y, 
+  uint16_t radius, 
+  float top_val_rad,
+  float bot_val_rad,
+  float gauge_top_rad,
+  float alarm_high_rad,
+  float warn_high_rad,
+  float warn_low_rad,
+  float alarm_low_rad,
+  float gauge_bot_rad, 
+  bool arc_is_clockwise
+) {
+  float x_stop_f = ceil(radius / sqrt(2.0));
+  for (int x = center_x; x < min(480, center_x + (int)x_stop_f); x++) {
+    int y = round(sqrt(radius * radius - (x - center_x) * (x - center_x)) + center_y);
+    int dx = x - center_x;
+    int dy = y - center_y;
+
+    int xs[8] = {dx, dy, -dy, -dx, -dx, -dy, dy, dx};
+    int ys[8] = {dy, dx, dx, dy, -dy, -dx, -dx, -dy};
+
+    for (int i = 0; i < 8; i++) {
+      float angle = atan2(ys[i], xs[i]);
+      uint16_t color;
+      if (
+          check_in_arc(gauge_top_rad, top_val_rad, angle, arc_is_clockwise) ||
+          check_in_arc(bot_val_rad, gauge_bot_rad, angle, arc_is_clockwise)
+      ) {
+        color = RGB565_BLACK;
+      } else if (check_in_arc(gauge_top_rad, alarm_high_rad, angle, arc_is_clockwise)) {
+        color = RGB565_RED;
+      } else if (check_in_arc(alarm_high_rad, warn_high_rad, angle, arc_is_clockwise)) {
+        color = RGB565_YELLOW;
+      } else if (check_in_arc(warn_high_rad, warn_low_rad, angle, arc_is_clockwise)) {
+        color = 0b0000011111100000;
+      } else if (check_in_arc(warn_low_rad, alarm_low_rad, angle, arc_is_clockwise)) {
+        color = RGB565_YELLOW;
+      } else if (check_in_arc(alarm_low_rad, gauge_bot_rad, angle, arc_is_clockwise)){
+        color = RGB565_RED;
+      } else {
+        continue;
+      }
+      gfx->writePixel(center_x + xs[i], center_y + ys[i], color);
+    }
+  }
+}
+
+
+bool check_in_arc(float arc_start, float arc_end, float value, bool arc_is_clockwise) {
+  // this case means we have a discontinuity
+  if (arc_is_clockwise && (arc_start < arc_end)) {
+    return (value < arc_start) || (value > arc_end);
+  }
+  return (value > min(arc_start, arc_end)) && (value < max(arc_end, arc_start));
+}
+
+
+void drawLineImpl(int start_x, int start_y, int end_x, int end_y, int thickness, uint16_t color) {
+  for (int x_offset = 1 - thickness; x_offset < thickness; x_offset++) {
+    for (int y_offset = 1 - thickness; y_offset < thickness; y_offset++) {
+      gfx->writeSlashLine(
+          start_x + x_offset, 
+          start_y + y_offset, 
+          end_x + x_offset, 
+          end_y + y_offset, color);
+    }
+  }
 }
 
 
@@ -102,125 +388,31 @@ void loop()
     expander->digitalWrite(PCA_TFT_BACKLIGHT, HIGH);
   }
 
-  // SPI state-machine handling
-  if (currentSPIState == IDLE) {
-    if (!currCSELStatus) {
-      rxBitCounter = 0;
-      rxByteCounter = 0;
-      for (int i=0; i < RX_BUF_SIZE; i++) {
-        rx_buf[i] = 0;
-      }
-      currentSPIState = LISTENING;
-      transmissionComplete = false;
-    }
-  } else if (currentSPIState == LISTENING) {
-    // first check to see if CSEL has 
-    // transitioned high, in which case we 
-    // return to the idle state
-    if (currCSELStatus) {
-      currentSPIState = IDLE;
-      transmissionComplete = true;
-    } else if ((rxByteCounter < RX_BUF_SIZE) && currSCLKStatus && !prevSCLKStatus) {
-      bool newBit = digitalRead(MOSI);
-      rx_buf[rxByteCounter] += newBit << (7 - rxBitCounter);
-      rxBitCounter++;
-      if (rxBitCounter == 8) {
-        rxBitCounter = 0;
-        rxByteCounter++;
-      }
-    }
-  }
-
   // for drawing, 0 degrees points straight to the right, and 
   // clockwise is the positive direction.
-
-  // drawing battery-related stuff
-  uint16_t maxPackVoltagemV = 0;
-  uint16_t minPackVoltagemV = 0;
-  uint16_t maxPackTempK = 0;
-  uint16_t minPackTempK = 0;
-
   if (transmissionComplete) {
 
-    maxPackVoltagemV = rx_buf[0] | (rx_buf[1] << 8);
-    minPackVoltagemV = rx_buf[2] | (rx_buf[3] << 8);
-    maxPackTempK = rx_buf[4] | (rx_buf[5] << 8);
-    minPackTempK = rx_buf[6] | (rx_buf[7] << 8);
+    rotate(maxPackVoltage_mV);
+    rotate(minPackVoltage_mV);
+    rotate(minPackTemp_K);
+    rotate(maxPackTemp_K);
+
+    maxPackVoltage_mV.newValue = rx_buf[0] | (rx_buf[1] << 8);
+    minPackVoltage_mV.newValue = rx_buf[2] | (rx_buf[3] << 8);
+    maxPackTemp_K.newValue = (rx_buf[4] | (rx_buf[5] << 8));
+    minPackTemp_K.newValue = (rx_buf[6] | (rx_buf[7] << 8));
+
+    gfx->startWrite();
+    renderGauge(voltageGauge, packVoltageLimits_mV, maxPackVoltage_mV, minPackVoltage_mV);
+    renderGauge(temperatureGauge, packTempLimits_K, maxPackTemp_K, minPackTemp_K);
+
+    gfx->endWrite();
+    gfx->flush();
+
     transmissionComplete = false;
-
-    float battScaleMax = 4.280;
-    float battScaleMin = 3.200;
-
-    float minBattAngle = scaleQuantity(
-        (float)minPackVoltagemV * 0.001,
-        battScaleMin,
-        battScaleMax,
-        60.0,
-        -60.0,
-        true
-        );
-    float maxBattAngle = scaleQuantity(
-        (float)maxPackVoltagemV * 0.001,
-        battScaleMin,
-        battScaleMax,
-        60.0, 
-        -60.0,
-        true
-        );
-
-    float tempScaleMin = -10;
-    float tempScaleMax = 50;
-    float minTempAngle = scaleQuantity(
-        (float)(minPackTempK - 273),
-        tempScaleMin,
-        tempScaleMax,
-        120.0,
-        -120.0,
-        false
-    );
-    float maxTempAngle = scaleQuantity(
-        (float)(maxPackTempK - 273),
-        tempScaleMin,
-        tempScaleMax,
-        120.0, 
-        -120.0,
-        false
-    );
-
-    gfx->fillScreen(RGB565_BLACK);
-    
-    char caption[15] = "";
-    memset(caption, 0, sizeof(caption));
-    formatBatteryVoltage(caption, true, minPackVoltagemV);
-    drawNeedle(
-        minBattAngle, caption, 
-        color_for_value(minPackVoltagemV, 3300, 3400, 4100, 4200)
-    );
-
-    memset(caption, 0, sizeof(caption));
-    formatBatteryVoltage(caption, false, maxPackVoltagemV);
-    drawNeedle(
-        maxBattAngle, caption,
-        color_for_value(maxPackVoltagemV, 3300, 3400, 4100, 4200)
-    );
-
-    memset(caption, 0, sizeof(caption));
-    formatBatteryTemperature(caption, true, (int16_t)minPackTempK - 273);
-    drawNeedle(
-        minTempAngle, caption,
-        color_for_value(minPackTempK, 0 + 273, 15 + 273, 27 + 273, 45 + 273)
-    );
-
-    memset(caption, 0, sizeof(caption));
-    formatBatteryTemperature(caption, false, (int16_t)maxPackTempK - 273);
-    drawNeedle(
-        maxTempAngle, caption,
-        color_for_value(maxPackTempK, 0 + 273, 15 + 273, 27 + 273, 45 + 273)
-    );
   }
+  delay(1000);
 
-  prevCSELStatus = currCSELStatus;
-  prevSCLKStatus = currSCLKStatus;
 }
 
 float clamp(float value, float minValue, float maxValue) {
@@ -336,7 +528,7 @@ void drawNeedle(float needleAngle, char* caption, uint16_t color) {
 
     for (int x_offset = -2; x_offset < 3; x_offset++) {
       for (int y_offset = -2; y_offset < 3; y_offset++) {
-        gfx->drawLine(
+        gfx->writeSlashLine(
             240 + x_offset, 240 + y_offset, 
             tip_x + x_offset, tip_y + y_offset, 
             color);
@@ -349,12 +541,11 @@ void drawNeedle(float needleAngle, char* caption, uint16_t color) {
 
 uint16_t color_for_value(
     uint16_t val, 
-    uint16_t danger_low, uint16_t warn_low, 
-    uint16_t warn_high, uint16_t danger_high
+    Limits &lims
 ) {
-  if ((val < danger_low) || (val > danger_high)) {
+  if ((val < lims.alarmLow) || (val > lims.alarmHigh)) {
     return 0xf00f;
-  } else if ((val < warn_low) || (val > warn_high)) {
+  } else if ((val < lims.warnLow) || (val > lims.warnHigh)) {
     return 0xfe0f;
   } 
   return 0xffff;
