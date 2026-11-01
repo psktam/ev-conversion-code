@@ -405,13 +405,46 @@ void loop()
     gfx->startWrite();
     renderGauge(voltageGauge, packVoltageLimits_mV, maxPackVoltage_mV, minPackVoltage_mV);
     renderGauge(temperatureGauge, packTempLimits_K, maxPackTemp_K, minPackTemp_K);
-
     gfx->endWrite();
     gfx->flush();
 
+    gfx->setCursor(270, 130);
+    gfx->setTextSize(2);
+    gfx->print("Max Pack");
+    gfx->setCursor(270, 160);
+    gfx->print("Voltage (V)");
+
+    gfx->setCursor(270, 275);
+    gfx->print("Min Pack");
+    gfx->setCursor(270, 305);
+    gfx->print("Voltage (V)");
+
+    gfx->setCursor(100, 130);
+    gfx->print("Max Pack");
+    gfx->setCursor(100, 160);
+    gfx->print("Temp (C)");
+
+    gfx->setCursor(100, 275);
+    gfx->print("Min Pack");
+    gfx->setCursor(100, 305);
+    gfx->print("Temp (C)");
+
+    gfx->setTextSize(4);
+    gfx->setCursor(270, 222);
+    gfx->print(maxPackVoltage_mV.newValue / 1000.0);
+
+    gfx->setCursor(270, 367);
+    gfx->print(minPackVoltage_mV.newValue / 1000.0);
+
+    gfx->setCursor(100, 222);
+    gfx->print(maxPackTemp_K.newValue - 273);
+
+    gfx->setCursor(100, 367);
+    gfx->print(minPackTemp_K.newValue - 273);
+
     transmissionComplete = false;
+    delay(1000);
   }
-  delay(1000);
 
 }
 
