@@ -144,6 +144,13 @@ void drawCross() {
   gfx->flush();
 }
 
+void blankDynamicTextAreas() {
+  gfx->writeFillRect(270, 182, 110, 40, RGB565_BLACK);
+  gfx->writeFillRect(270, 327, 110, 40, RGB565_BLACK);
+  gfx->writeFillRect(100, 182, 110, 40, RGB565_BLACK);
+  gfx->writeFillRect(100, 327, 110, 40, RGB565_BLACK);
+}
+
 
 void setup(void)
 {
@@ -199,6 +206,30 @@ void setup(void)
   // initial drawing
   gfx->fillScreen(RGB565_BLACK);
   gfx->setFont(u8g2_font_crox1hb_tf);
+  gfx->setTextColor(RGB565_WHITE, RGB565_BLACK);
+
+  gfx->setCursor(270, 130);
+  gfx->setTextSize(2);
+  gfx->print("Max Pack");
+  gfx->setCursor(270, 160);
+  gfx->print("Voltage (V)");
+
+  gfx->setCursor(270, 275);
+  gfx->print("Min Pack");
+  gfx->setCursor(270, 305);
+  gfx->print("Voltage (V)");
+
+  gfx->setCursor(100, 130);
+  gfx->print("Max Pack");
+  gfx->setCursor(100, 160);
+  gfx->print("Temp (C)");
+
+  gfx->setCursor(100, 275);
+  gfx->print("Min Pack");
+  gfx->setCursor(100, 305);
+  gfx->print("Temp (C)");
+  gfx->setTextSize(4);
+
   drawCross();
 
   expander->pinMode(PCA_TFT_BACKLIGHT, OUTPUT);
@@ -405,30 +436,11 @@ void loop()
     gfx->startWrite();
     renderGauge(voltageGauge, packVoltageLimits_mV, maxPackVoltage_mV, minPackVoltage_mV);
     renderGauge(temperatureGauge, packTempLimits_K, maxPackTemp_K, minPackTemp_K);
+    blankDynamicTextAreas();
     gfx->endWrite();
     gfx->flush();
 
-    gfx->setCursor(270, 130);
-    gfx->setTextSize(2);
-    gfx->print("Max Pack");
-    gfx->setCursor(270, 160);
-    gfx->print("Voltage (V)");
-
-    gfx->setCursor(270, 275);
-    gfx->print("Min Pack");
-    gfx->setCursor(270, 305);
-    gfx->print("Voltage (V)");
-
-    gfx->setCursor(100, 130);
-    gfx->print("Max Pack");
-    gfx->setCursor(100, 160);
-    gfx->print("Temp (C)");
-
-    gfx->setCursor(100, 275);
-    gfx->print("Min Pack");
-    gfx->setCursor(100, 305);
-    gfx->print("Temp (C)");
-
+    // update text readouts
     gfx->setTextSize(4);
     gfx->setCursor(270, 222);
     gfx->print(maxPackVoltage_mV.newValue / 1000.0);
@@ -441,9 +453,9 @@ void loop()
 
     gfx->setCursor(100, 367);
     gfx->print(minPackTemp_K.newValue - 273);
+    gfx->flush();
 
     transmissionComplete = false;
-    delay(1000);
   }
 
 }
