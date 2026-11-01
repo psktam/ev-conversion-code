@@ -240,10 +240,10 @@ uint16_t battery_state_of_charge_decipct = 1000;  // "decipercent"
 uint16_t battery_summary_voltage_v;
 uint16_t battery_summary_current_a;
 uint16_t battery_summary_temperature_c;
-uint16_t battery_max_pack_voltage_v = 3450;
-uint16_t battery_min_pack_voltage_v = 4120;
-uint16_t battery_max_pack_temp_c = 273 + 30;
-uint16_t battery_min_pack_temp_c = 273 - 5;
+uint16_t battery_max_pack_voltage_v = 4120;
+uint16_t battery_min_pack_voltage_v = 3450;
+uint16_t battery_max_pack_temp_c = 273 + 50;
+uint16_t battery_min_pack_temp_c = 273 - 10;
 
 
 bool unpackBMSCAN(uint32_t message_id, uint8_t len, uint8_t buf[]) {
@@ -355,6 +355,16 @@ void writeLCD() {
 void writeBatteryTFT() {
   digitalWrite(DO_LEFT_LCD_CS, LOW);
   delay(1);
+
+  // uint16_t bv0 = random(3200, 4280);
+  // uint16_t bv1 = random(3200, 4280);
+  // battery_max_pack_voltage_v = max(bv0, bv1);
+  // battery_min_pack_voltage_v = min(bv0, bv1);
+  // uint16_t t0 = random(273 - 10, 273 + 50);
+  // uint16_t t1 = random(273 - 10, 273 + 50);
+  // battery_max_pack_temp_c = max(t0, t1);
+  // battery_min_pack_temp_c = min(t0, t1);
+
   SPITransfer16(battery_max_pack_voltage_v, 5);
   SPITransfer16(battery_min_pack_voltage_v, 5);
   SPITransfer16(battery_max_pack_temp_c, 5);
@@ -372,6 +382,8 @@ void writeVehicleStatusTFT() {
     (status_rl_door_warning << 5) | 
     (status_rr_door_warning << 6) | 
     (status_tailgate_warning << 7);
+
+  // uint8_t status = random(0, 0xff);
 
   digitalWrite(DO_RIGHT_LCD_CS, LOW);
   delay(1);
@@ -432,7 +444,7 @@ void loop() {
     last_dispatch_time = millis();
   }
 
-  delay(50);
+  delay(1000);
   bool current_keyswitch_state = digitalRead(DI_KEY_SWITCH);
 
   if (!current_keyswitch_state && prev_keyswitch_state) {
